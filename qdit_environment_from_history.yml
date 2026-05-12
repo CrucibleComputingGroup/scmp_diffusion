@@ -1,0 +1,7 @@
+name: qdit
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - nvtop
+prefix: /home/zhkangqi/miniconda3/envs/qdit
