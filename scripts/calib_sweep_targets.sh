@@ -29,7 +29,7 @@ for entry in "${TARGETS[@]}"; do
     --budget_ratio "$BR" \
     --budget_ref_stoc_len 256 \
     --metric cosine --teacher fp \
-    --sc_prec 8 --sc_fixed_level_prec --sc_enable \
+    --sc_prec 8 --sc_fixed_level_prec \
     --wbits 8 --abits 8 --w_sym --a_sym \
     --image-size 256 --num-sampling-steps 50 \
     --num_calib_batches 1 --num_calib_timesteps 6 \

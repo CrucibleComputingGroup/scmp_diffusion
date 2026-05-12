@@ -180,10 +180,6 @@ def _resolve_level_sc_prec(module, stoc_len: int) -> int:
 
 
 def _resolve_level_rng_levels(module, stoc_len: int) -> int | None:
-    if module.sc_controller.sc_enable and module.sc_controller.fixed_level_sc_prec:
-        # Keep RNG grid at 2**sc_prec so quantization stays int8 across
-        # all stoc_len levels; only stream length varies.
-        return None
     return None
 
 

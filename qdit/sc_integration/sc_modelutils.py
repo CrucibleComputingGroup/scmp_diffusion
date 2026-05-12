@@ -234,7 +234,6 @@ def create_sc_controller_from_args(args, model) -> SCController:
         inputprojlayerwise=getattr(args, 'inputprojlayerwise', 0.0),
         reverse_layerwise=getattr(args, 'reverse_layerwise', False),
         sc_skip_blocks=sc_skip_blocks,
-        sc_enable=getattr(args, 'sc_enable', False),
         noise_model=getattr(args, 'sc_noise_model', False),
         noise_local_correction=getattr(args, 'sc_noise_local_correction', 0.15),
         noise_global_correction=getattr(args, 'sc_noise_global_correction', 0.60),

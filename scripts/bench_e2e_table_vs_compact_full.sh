@@ -21,7 +21,7 @@ COMMON_ARGS=(
     --w_sym --a_sym
     --timewise 1 --qklayerwise 1.0 --avlayerwise 1.0
     --projlayerwise 1.0 --mlplayerwise 1.0 --inputprojlayerwise 1.0
-    --sc_prec 8 --sc_enable
+    --sc_prec 8
     --adaptive_mp --mp_levels 256,128,64,32,16
     --mp_alpha 0.3 --mp_beta 0.1
     --image-size 256 --num-sampling-steps 100 --batch-size 16

@@ -161,10 +161,6 @@ class SCAttention(nn.Module):
 
     def _rng_levels(self, stoc_len: int) -> Optional[int]:
         """Enable-signal RNG/grid size for fixed-level precision mode."""
-        if self.sc_controller.sc_enable and self.sc_controller.fixed_level_sc_prec:
-            # Keep RNG grid at 2**sc_prec so quantization stays int8 across
-            # all stoc_len levels; only stream length varies.
-            return None
         return None
 
     # =================================================================
@@ -353,6 +349,7 @@ class SCAttention(nn.Module):
             sp = self.sc_controller.resolve_sc_prec(sl)
             x_sub = x_flat[rows].contiguous()
 
+            granularity = "per_row" if grouped else "per_tensor"
             if chunk_d > 0 and D > chunk_d:
                 sub_result = None
                 for start in range(0, D, chunk_d):
@@ -361,18 +358,13 @@ class SCAttention(nn.Module):
                     w_chunk = weight[:, start:end].contiguous()
                     config = self._get_sc_config(end - start, sp)
 
-                    kwargs = dict(mode=self.sc_mode, sc_prec=sp, config=config,
-                                  stoc_len=sl)
-                    if self.sc_controller.sc_enable:
-                        kwargs["rng_levels"] = self._rng_levels(sl)
+                    kwargs = dict(granularity=granularity,
+                                  mode=self.sc_mode, sc_prec=sp, config=config,
+                                  stoc_len=sl, rng_levels=self._rng_levels(sl))
                     if grouped:
                         kwargs.update(group_a=1, group_b=1)
 
-                    chunk_out = matmul_fn(
-                        x_chunk, w_chunk,
-                        x_chunk.max().item(), x_chunk.min().item(),
-                        w_chunk.max().item(), w_chunk.min().item(),
-                        **kwargs)
+                    chunk_out = matmul_fn(x_chunk, w_chunk, **kwargs)
 
                     if sub_result is None:
                         sub_result = chunk_out
@@ -381,17 +373,13 @@ class SCAttention(nn.Module):
                 result[rows] = sub_result
             else:
                 config = self._get_sc_config(D, sp)
-                kwargs = dict(mode=self.sc_mode, sc_prec=sp, config=config,
-                              stoc_len=sl)
-                if self.sc_controller.sc_enable:
-                    kwargs["rng_levels"] = self._rng_levels(sl)
+                kwargs = dict(granularity=granularity,
+                              mode=self.sc_mode, sc_prec=sp, config=config,
+                              stoc_len=sl, rng_levels=self._rng_levels(sl))
                 if grouped:
                     kwargs.update(group_a=1, group_b=1)
 
-                sub = matmul_fn(x_sub, weight,
-                                x_sub.max().item(), x_sub.min().item(),
-                                weight.max().item(), weight.min().item(),
-                                **kwargs)
+                sub = matmul_fn(x_sub, weight, **kwargs)
                 result[rows] = sub
 
         MPDistributionLogger.log_compute(
@@ -491,6 +479,7 @@ class SCAttention(nn.Module):
                 sp = self.sc_controller.resolve_sc_prec(eff_sl_val)
                 x_sub = x_flat[rows].contiguous()
 
+                granularity = "per_row" if grouped else "per_tensor"
                 if chunk_d > 0 and D > chunk_d:
                     sub_result = None
                     for start in range(0, D, chunk_d):
@@ -499,18 +488,14 @@ class SCAttention(nn.Module):
                         w_chunk = entry.weight[:, start:end].contiguous()
                         config = self._get_sc_config(end - start, sp)
 
-                        kwargs = dict(mode=self.sc_mode, sc_prec=sp,
-                                      config=config, stoc_len=eff_sl_val)
-                        if self.sc_controller.sc_enable:
-                            kwargs["rng_levels"] = self._rng_levels(eff_sl_val)
+                        kwargs = dict(granularity=granularity,
+                                      mode=self.sc_mode, sc_prec=sp,
+                                      config=config, stoc_len=eff_sl_val,
+                                      rng_levels=self._rng_levels(eff_sl_val))
                         if grouped:
                             kwargs.update(group_a=1, group_b=1)
 
-                        chunk_out = matmul_fn(
-                            x_chunk, w_chunk,
-                            x_chunk.max().item(), x_chunk.min().item(),
-                            w_chunk.max().item(), w_chunk.min().item(),
-                            **kwargs)
+                        chunk_out = matmul_fn(x_chunk, w_chunk, **kwargs)
 
                         if sub_result is None:
                             sub_result = chunk_out
@@ -520,18 +505,14 @@ class SCAttention(nn.Module):
                     result[rows.unsqueeze(1), entry.out_indices.unsqueeze(0)] = sub_result
                 else:
                     config = self._get_sc_config(D, sp)
-                    kwargs = dict(mode=self.sc_mode, sc_prec=sp,
-                                  config=config, stoc_len=eff_sl_val)
-                    if self.sc_controller.sc_enable:
-                        kwargs["rng_levels"] = self._rng_levels(eff_sl_val)
+                    kwargs = dict(granularity=granularity,
+                                  mode=self.sc_mode, sc_prec=sp,
+                                  config=config, stoc_len=eff_sl_val,
+                                  rng_levels=self._rng_levels(eff_sl_val))
                     if grouped:
                         kwargs.update(group_a=1, group_b=1)
 
-                    sub = matmul_fn(
-                        x_sub, entry.weight,
-                        x_sub.max().item(), x_sub.min().item(),
-                        entry.weight.max().item(), entry.weight.min().item(),
-                        **kwargs)
+                    sub = matmul_fn(x_sub, entry.weight, **kwargs)
                     result[rows.unsqueeze(1), entry.out_indices.unsqueeze(0)] = sub
 
         MPDistributionLogger.log_compute(
@@ -603,6 +584,7 @@ class SCAttention(nn.Module):
             compute_baseline += M * n_out * D * baseline_stoc_len
             compute_actual += M * n_out * D * entry.stoc_len
 
+            granularity = "per_row" if grouped else "per_tensor"
             if chunk_d > 0 and D > chunk_d:
                 sub_result = None
                 for start in range(0, D, chunk_d):
@@ -613,18 +595,14 @@ class SCAttention(nn.Module):
                     config = self._get_sc_config(chunk_size, entry.sc_prec)
 
                     kwargs = dict(
+                        granularity=granularity,
                         mode=self.sc_mode, sc_prec=entry.sc_prec,
-                        config=config, stoc_len=entry.stoc_len)
-                    if self.sc_controller.sc_enable:
-                        kwargs["rng_levels"] = self._rng_levels(entry.stoc_len)
+                        config=config, stoc_len=entry.stoc_len,
+                        rng_levels=self._rng_levels(entry.stoc_len))
                     if grouped:
                         kwargs.update(group_a=1, group_b=1)
 
-                    chunk_out = matmul_fn(
-                        x_chunk, w_chunk,
-                        x_chunk.max().item(), x_chunk.min().item(),
-                        w_chunk.max().item(), w_chunk.min().item(),
-                        **kwargs)
+                    chunk_out = matmul_fn(x_chunk, w_chunk, **kwargs)
 
                     if sub_result is None:
                         sub_result = chunk_out
@@ -634,17 +612,14 @@ class SCAttention(nn.Module):
             else:
                 config = self._get_sc_config(D, entry.sc_prec)
                 kwargs = dict(
+                    granularity=granularity,
                     mode=self.sc_mode, sc_prec=entry.sc_prec,
-                    config=config, stoc_len=entry.stoc_len)
-                if self.sc_controller.sc_enable:
-                    kwargs["rng_levels"] = self._rng_levels(entry.stoc_len)
+                    config=config, stoc_len=entry.stoc_len,
+                    rng_levels=self._rng_levels(entry.stoc_len))
                 if grouped:
                     kwargs.update(group_a=1, group_b=1)
 
-                sub = matmul_fn(x_flat, entry.weight,
-                                x_flat.max().item(), x_flat.min().item(),
-                                entry.weight.max().item(), entry.weight.min().item(),
-                                **kwargs)
+                sub = matmul_fn(x_flat, entry.weight, **kwargs)
                 result[:, entry.out_indices] = sub
 
         MPDistributionLogger.log_compute(
@@ -730,7 +705,7 @@ class SCAttention(nn.Module):
                 k_h = k[:, h].float()
 
                 matmul_fn = self._get_matmul_fn()
-                if self.sc_controller.sc_enable and self.sc_mode == "bipolar":
+                if self.sc_mode == "bipolar":
                     output[:, h] = matmul_fn(
                         q_h, k_h, granularity="per_head", mode="bipolar",
                         sc_prec=sp, config=config, stoc_len=sl,
@@ -774,7 +749,7 @@ class SCAttention(nn.Module):
         matmul_fn = self._get_matmul_fn()
 
         # Fast path: fully batched kernel via granularity="per_head"
-        if self.sc_controller.sc_enable and self.sc_mode == "bipolar":
+        if self.sc_mode == "bipolar":
             output = matmul_fn(
                 q_flat, k_flat, granularity="per_head", mode="bipolar",
                 sc_prec=sc_prec, config=config, stoc_len=stoc_len,

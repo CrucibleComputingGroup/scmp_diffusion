@@ -420,8 +420,6 @@ def main():
         quant_string_name += f"_mlp{args.mlplayerwise}"
     if args.inputprojlayerwise > 0:
         quant_string_name += f"_inproj{args.inputprojlayerwise}"
-    if args.sc_enable:
-        quant_string_name += "_enable"
     if args.sc_fixed_level_prec:
         quant_string_name += "_fixlvlprec"
     if args.sc_noise_model:
@@ -473,7 +471,6 @@ def main():
                  f"avlayerwise={args.avlayerwise}, projlayerwise={args.projlayerwise}, "
                  f"mlplayerwise={args.mlplayerwise}, inputprojlayerwise={args.inputprojlayerwise}, "
                  f"sc_prec={args.sc_prec}, sc_fixed_level_prec={args.sc_fixed_level_prec}, "
-                 f"sc_enable={args.sc_enable}, "
                  f"sc_noise_model={args.sc_noise_model}")
     logging.info(f"Quant Parameters: wbits={args.wbits}, abits={args.abits}, w_sym={args.w_sym}, a_sym={args.a_sym}")
 
@@ -684,14 +681,10 @@ def create_argparser():
              'Without this flag, runtime derives sc_prec from each stoc_len via ceil(log2(stoc_len)).'
     )
     parser.add_argument(
-        '--sc_enable', action='store_true',
-        help='Use enable-signal SC multiplication (B RNG gated by A bits) instead of standard XNOR/AND.'
-    )
-    parser.add_argument(
         '--sc_noise_model', action='store_true',
         help='Fast simulation: replace real SC kernels with closed-form '
              'analytical Gaussian noise surrogate (exact Bernoulli variance, '
-             'no hyperparameters). Orthogonal to --sc_enable. Intended for '
+             'no hyperparameters). Intended for '
              '50k FID sweeps where bitstream SC is too slow.'
     )
     parser.add_argument(

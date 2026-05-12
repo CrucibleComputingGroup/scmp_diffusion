@@ -50,7 +50,7 @@ run_one() {
     --wbits 8 --abits 8 --w_sym --a_sym \
     --timewise 1 --qklayerwise 1.0 --avlayerwise 1.0 \
     --projlayerwise 1.0 --mlplayerwise 1.0 --inputprojlayerwise 1.0 \
-    --sc_prec 8 --sc_fixed_level_prec --sc_enable \
+    --sc_prec 8 --sc_fixed_level_prec \
     --image-size 256 --num-sampling-steps "$NUM_STEPS" --cfg-scale "$CFG_SCALE" \
     --batch-size "$BATCH" --seed "$SEED" \
     --generate-fid-samples --num-fid-samples "$NUM_FID" \

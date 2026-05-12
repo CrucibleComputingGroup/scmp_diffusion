@@ -26,7 +26,7 @@ for MODE in "${MODES[@]}"; do
       --wbits 8 --abits 8 --w_sym --a_sym \
       --timewise 1 --qklayerwise 1.0 --avlayerwise 1.0 \
       --projlayerwise 1.0 --mlplayerwise 1.0 --inputprojlayerwise 1.0 \
-      --sc_prec 8 --sc_fixed_level_prec --sc_enable \
+      --sc_prec 8 --sc_fixed_level_prec \
       --sc_config "results/sc_cfg_uniform${L}_all.json" \
       --image-size 256 --num-sampling-steps 50 --cfg-scale 4 --batch-size 8 \
       --seed "${SEED}" \

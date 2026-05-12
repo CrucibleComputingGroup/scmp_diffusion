@@ -43,7 +43,7 @@ BASE_CMD="python scripts/quant_sc_main.py \
   --timewise 1 --qklayerwise 1.0 --avlayerwise 1.0 \
   --projlayerwise 1.0 --mlplayerwise 1.0 --inputprojlayerwise 1.0 \
   --sc_prec 8 --image-size 256 --num-sampling-steps 100 \
-  --cfg-scale 4 --batch-size 16 --sc_enable \
+  --cfg-scale 4 --batch-size 16 \
   --adaptive_mp --mp_levels 256,128,64,32,16"
 
 # Collect all jobs

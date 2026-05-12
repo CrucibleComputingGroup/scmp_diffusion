@@ -27,7 +27,7 @@ for TARGET in 128 96 64 48 32; do
     --wbits 8 --abits 8 --w_sym --a_sym \
     --timewise 1 --qklayerwise 1.0 --avlayerwise 1.0 \
     --projlayerwise 1.0 --mlplayerwise 1.0 --inputprojlayerwise 1.0 \
-    --sc_prec 8 --sc_fixed_level_prec --sc_enable \
+    --sc_prec 8 --sc_fixed_level_prec \
     --adaptive_mp \
     --adaptive_mp_table "$CALIB_JSON" \
     --mp_levels 256,192,128,96,64,48,32,16 \

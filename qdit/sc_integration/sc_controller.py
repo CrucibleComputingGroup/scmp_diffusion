@@ -57,7 +57,6 @@ class SCController:
         inputprojlayerwise: float = 0.0,
         reverse_layerwise: bool = False,
         sc_skip_blocks: Optional[set] = None,
-        sc_enable: bool = False,
         noise_model: bool = False,
         noise_local_correction: float = 0.15,
         noise_global_correction: float = 0.60,
@@ -91,7 +90,6 @@ class SCController:
         self.sc_prec = sc_prec
         self.stoc_len = 2 ** sc_prec                # 256 for sc_prec=8
         self.quant_max = 2 ** (sc_prec - 1) - 1     # 127 for sc_prec=8
-        self.sc_enable = sc_enable                   # Use enable-signal SC multiplication
         self.noise_model = noise_model               # Closed-form SC noise surrogate (fast sim)
         self.noise_local_correction = noise_local_correction
         self.noise_global_correction = noise_global_correction
@@ -367,6 +365,5 @@ class SCController:
             f"total_timesteps={self.total_timesteps}, "
             f"total_blocks={self.total_blocks}, "
             f"sc_prec={self.sc_prec}, "
-            f"sc_enable={self.sc_enable}, "
             f"quant_max={self.quant_max})"
         )

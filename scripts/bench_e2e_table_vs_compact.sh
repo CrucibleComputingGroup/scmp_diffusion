@@ -27,7 +27,6 @@ COMMON_ARGS=(
     --timewise "$TW"
     --qklayerwise "$QK_LW"
     --sc_prec "$SC_PREC"
-    --sc_enable
     --image-size 256
     --num-sampling-steps "$STEPS"
     --batch-size "$BATCH"

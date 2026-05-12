@@ -95,10 +95,6 @@ class SCMlp(nn.Module):
 
     def _rng_levels(self, stoc_len: int) -> Optional[int]:
         """Enable-signal RNG/grid size for fixed-level precision mode."""
-        if self.sc_controller.sc_enable and self.sc_controller.fixed_level_sc_prec:
-            # Keep RNG grid at 2**sc_prec so quantization stays int8 across
-            # all stoc_len levels; only stream length varies.
-            return None
         return None
 
     # =================================================================
