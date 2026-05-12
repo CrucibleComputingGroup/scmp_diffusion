@@ -49,7 +49,7 @@ from qdit.sc_integration import (
     create_sc_controller_from_args,
     quantize_sc_model,
 )
-from qdit.sc_integration.sc_attention import sc_matmul_enable_triton_mlp, sc_matmul_mlp
+from scmp_kernels.sc import sc_matmul
 from quant_sc_main import SCDiffusionWrapper, create_argparser
 from utils.download import find_model
 
@@ -456,13 +456,10 @@ def _run_attention_linear_level(
                 x_chunk = x_flat[:, start:end].contiguous()
                 w_chunk = weight[:, start:end].contiguous()
                 config = module._get_sc_config(end - start, sc_prec)
-                chunk_result = sc_matmul_enable_triton_mlp(
+                chunk_result = sc_matmul(
                     x_chunk,
                     w_chunk,
-                    x_chunk.max().item(),
-                    x_chunk.min().item(),
-                    w_chunk.max().item(),
-                    w_chunk.min().item(),
+                    granularity="per_row",
                     mode=module.sc_mode,
                     sc_prec=sc_prec,
                     config=config,
@@ -475,13 +472,10 @@ def _run_attention_linear_level(
                 result = chunk_result if result is None else result + chunk_result
         else:
             config = module._get_sc_config(d_model, sc_prec)
-            result = sc_matmul_enable_triton_mlp(
+            result = sc_matmul(
                     x_flat,
                     weight,
-                    x_flat.max().item(),
-                    x_flat.min().item(),
-                    weight.max().item(),
-                    weight.min().item(),
+                    granularity="per_row",
                     mode=module.sc_mode,
                     sc_prec=sc_prec,
                     config=config,
@@ -550,13 +544,10 @@ def _run_mlp_linear_level(
             result = chunk_result if result is None else result + chunk_result
     else:
         config = module._get_sc_config(d_model, sc_prec)
-        result = sc_matmul_enable_triton_mlp(
+        result = sc_matmul(
             x_flat,
             weight,
-            x_flat.max().item(),
-            x_flat.min().item(),
-            weight.max().item(),
-            weight.min().item(),
+            granularity="per_row",
             mode=module.sc_mode,
             sc_prec=sc_prec,
             config=config,

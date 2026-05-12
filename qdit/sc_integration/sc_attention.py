@@ -25,15 +25,7 @@ from ..qLinearLayer import QLinearLayer
 from .sc_controller import SCController
 from .mp_config import classify_rows_by_metric, adaptive_classify_rows, MPDistributionLogger, MetricProfiler
 
-from scmp_kernels.sc import (
-    sc_matmul_per_tensor as sc_matmul,
-    sc_matmul_grouped,
-    sc_matmul_enable_triton,
-    sc_matmul_grouped_enable_triton,
-    sc_matmul_enable_batched_bipolar,
-    sc_matmul_mlp,
-    sc_matmul_enable_triton_mlp,
-)
+from scmp_kernels.sc import sc_matmul
 from scmp_kernels.sc.config_helpers import make_sobol_simple_config
 
 
@@ -160,39 +152,12 @@ class SCAttention(nn.Module):
             self._sc_configs[key] = make_sobol_simple_config(D, D, sc_prec)
         return self._sc_configs[key]
 
-    def _get_sc_matmul_fn(self):
-        """Return the SC matmul function based on enable-signal flag."""
+    def _get_matmul_fn(self):
+        """Return the SC matmul function — real Triton path or surrogate."""
         if self.sc_controller.noise_model:
             from .noise_matmul import noisy_sc_matmul
             return noisy_sc_matmul
-        if self.sc_controller.sc_enable:
-            return sc_matmul_enable_triton
         return sc_matmul
-
-    def _get_mlp_matmul_fn(self):
-        """Return the per-row-grouped (MLP-style) SC matmul function."""
-        if self.sc_controller.noise_model:
-            from .noise_matmul import noisy_sc_matmul_mlp
-            return noisy_sc_matmul_mlp
-        if self.sc_controller.sc_enable:
-            return sc_matmul_enable_triton_mlp
-        return sc_matmul_mlp
-
-    def _get_av_grouped_fn(self):
-        """Return the AV 'grouped' SC matmul function."""
-        if self.sc_controller.noise_model:
-            from .noise_matmul import noisy_sc_matmul_grouped
-            return noisy_sc_matmul_grouped
-        if self.sc_controller.sc_enable:
-            return sc_matmul_grouped_enable_triton
-        return sc_matmul_grouped
-
-    def _get_batched_bipolar_fn(self):
-        """Return the QK-batched bipolar SC matmul function."""
-        if self.sc_controller.noise_model:
-            from .noise_matmul import noisy_sc_matmul_enable_batched_bipolar
-            return noisy_sc_matmul_enable_batched_bipolar
-        return sc_matmul_enable_batched_bipolar
 
     def _rng_levels(self, stoc_len: int) -> Optional[int]:
         """Enable-signal RNG/grid size for fixed-level precision mode."""
@@ -294,10 +259,8 @@ class SCAttention(nn.Module):
                 result = result + bias
             return result.reshape(*orig_shape[:-1], -1)
 
-        if grouped:
-            matmul_fn = self._get_mlp_matmul_fn()
-        else:
-            matmul_fn = self._get_sc_matmul_fn()
+        matmul_fn = self._get_matmul_fn()
+        granularity = "per_row" if grouped else "per_tensor"
 
         if chunk_d > 0 and D > chunk_d:
             result = None
@@ -309,18 +272,14 @@ class SCAttention(nn.Module):
                 config = self._get_sc_config(chunk_size, sc_prec)
 
                 kwargs = dict(
+                    granularity=granularity,
                     mode=self.sc_mode, sc_prec=sc_prec, config=config,
-                    stoc_len=stoc_len)
-                if self.sc_controller.sc_enable:
-                    kwargs["rng_levels"] = self._rng_levels(stoc_len)
+                    stoc_len=stoc_len,
+                    rng_levels=self._rng_levels(stoc_len))
                 if grouped:
                     kwargs.update(group_a=1, group_b=1)
 
-                chunk_result = matmul_fn(
-                    x_chunk, w_chunk,
-                    x_chunk.max().item(), x_chunk.min().item(),
-                    w_chunk.max().item(), w_chunk.min().item(),
-                    **kwargs)
+                chunk_result = matmul_fn(x_chunk, w_chunk, **kwargs)
 
                 if result is None:
                     result = chunk_result
@@ -329,17 +288,14 @@ class SCAttention(nn.Module):
         else:
             config = self._get_sc_config(D, sc_prec)
             kwargs = dict(
+                granularity=granularity,
                 mode=self.sc_mode, sc_prec=sc_prec, config=config,
-                stoc_len=stoc_len)
-            if self.sc_controller.sc_enable:
-                kwargs["rng_levels"] = self._rng_levels(stoc_len)
+                stoc_len=stoc_len,
+                rng_levels=self._rng_levels(stoc_len))
             if grouped:
                 kwargs.update(group_a=1, group_b=1)
 
-            result = matmul_fn(x_flat, weight,
-                               x_flat.max().item(), x_flat.min().item(),
-                               weight.max().item(), weight.min().item(),
-                               **kwargs)
+            result = matmul_fn(x_flat, weight, **kwargs)
 
         if bias is not None:
             result = result + bias
@@ -376,10 +332,8 @@ class SCAttention(nn.Module):
             self.sc_controller.current_timestep, self.block_idx,
             operator, assignment, M)
 
-        if grouped:
-            matmul_fn = self._get_mlp_matmul_fn()
-        else:
-            matmul_fn = self._get_sc_matmul_fn()
+        matmul_fn = self._get_matmul_fn()
+        granularity = "per_row" if grouped else "per_tensor"
 
         out_features = weight.shape[0]
         result = torch.zeros(M, out_features,
@@ -497,10 +451,8 @@ class SCAttention(nn.Module):
             if len(rows) > 0:
                 row_stoc_lens[rows] = sl
 
-        if grouped:
-            matmul_fn = self._get_mlp_matmul_fn()
-        else:
-            matmul_fn = self._get_sc_matmul_fn()
+        matmul_fn = self._get_matmul_fn()
+        granularity = "per_row" if grouped else "per_tensor"
 
         baseline_stoc_len = self.sc_controller.stoc_len
         # Baseline: all M rows * all out_features at max_stoc_len
@@ -636,10 +588,8 @@ class SCAttention(nn.Module):
         x_flat = x.reshape(-1, D)
         M = x_flat.shape[0]
 
-        if grouped:
-            matmul_fn = self._get_mlp_matmul_fn()
-        else:
-            matmul_fn = self._get_sc_matmul_fn()
+        matmul_fn = self._get_matmul_fn()
+        granularity = "per_row" if grouped else "per_tensor"
 
         baseline_stoc_len = self.sc_controller.stoc_len
         compute_baseline = 0
@@ -779,29 +729,20 @@ class SCAttention(nn.Module):
                 q_h = q_scaled[:, h].float()
                 k_h = k[:, h].float()
 
+                matmul_fn = self._get_matmul_fn()
                 if self.sc_controller.sc_enable and self.sc_mode == "bipolar":
-                    q_maxs = q_h.amax(dim=(1, 2))
-                    q_mins = q_h.amin(dim=(1, 2))
-                    k_maxs = k_h.amax(dim=(1, 2))
-                    k_mins = k_h.amin(dim=(1, 2))
-                    out_h = self._get_batched_bipolar_fn()(
-                        q_h, k_h, q_maxs, q_mins, k_maxs, k_mins,
-                        sp, config, stoc_len=sl,
+                    output[:, h] = matmul_fn(
+                        q_h, k_h, granularity="per_head", mode="bipolar",
+                        sc_prec=sp, config=config, stoc_len=sl,
                         rng_levels=self._rng_levels(sl),
                     )
-                    output[:, h] = out_h
                 else:
-                    matmul_fn = self._get_sc_matmul_fn()
                     for b_idx in range(B):
-                        qi = q_h[b_idx]
-                        ki = k_h[b_idx]
                         output[b_idx, h] = matmul_fn(
-                            qi, ki,
-                            qi.max().item(), qi.min().item(),
-                            ki.max().item(), ki.min().item(),
-                            mode=self.sc_mode, sc_prec=sp, config=config,
-                            stoc_len=sl,
-                            rng_levels=self._rng_levels(sl) if self.sc_controller.sc_enable else None,
+                            q_h[b_idx], k_h[b_idx],
+                            granularity="per_tensor", mode=self.sc_mode,
+                            sc_prec=sp, config=config, stoc_len=sl,
+                            rng_levels=self._rng_levels(sl),
                         )
 
         MPDistributionLogger.log_compute(
@@ -830,37 +771,26 @@ class SCAttention(nn.Module):
         q_flat = q_scaled.reshape(B * H, N, D).float()
         k_flat = k.reshape(B * H, N, D).float()
 
-        q_maxs = q_flat.amax(dim=(1, 2))
-        q_mins = q_flat.amin(dim=(1, 2))
-        k_maxs = k_flat.amax(dim=(1, 2))
-        k_mins = k_flat.amin(dim=(1, 2))
+        matmul_fn = self._get_matmul_fn()
 
-        # Fast path: fully batched kernel
+        # Fast path: fully batched kernel via granularity="per_head"
         if self.sc_controller.sc_enable and self.sc_mode == "bipolar":
-            output = self._get_batched_bipolar_fn()(
-                q_flat, k_flat, q_maxs, q_mins, k_maxs, k_mins,
-                sc_prec, config, stoc_len=stoc_len,
+            output = matmul_fn(
+                q_flat, k_flat, granularity="per_head", mode="bipolar",
+                sc_prec=sc_prec, config=config, stoc_len=stoc_len,
                 rng_levels=self._rng_levels(stoc_len),
             )
             return output.reshape(B, H, N, N)
 
         # Fallback: per-head loop
-        matmul_fn = self._get_sc_matmul_fn()
-        q_maxs_cpu = q_maxs.cpu()
-        q_mins_cpu = q_mins.cpu()
-        k_maxs_cpu = k_maxs.cpu()
-        k_mins_cpu = k_mins.cpu()
-
         BH = B * H
         output = torch.empty(BH, N, N, dtype=torch.float32, device=q_scaled.device)
         for i in range(BH):
             output[i] = matmul_fn(
                 q_flat[i], k_flat[i],
-                q_maxs_cpu[i].item(), q_mins_cpu[i].item(),
-                k_maxs_cpu[i].item(), k_mins_cpu[i].item(),
-                mode=self.sc_mode, sc_prec=sc_prec, config=config,
-                stoc_len=stoc_len,
-                rng_levels=self._rng_levels(stoc_len) if self.sc_controller.sc_enable else None,
+                granularity="per_tensor", mode=self.sc_mode,
+                sc_prec=sc_prec, config=config, stoc_len=stoc_len,
+                rng_levels=self._rng_levels(stoc_len),
             )
 
         return output.reshape(B, H, N, N)
@@ -884,7 +814,7 @@ class SCAttention(nn.Module):
         G_attn = self.av_attn_group_size if self.av_attn_group_size > 0 else N
         G_v = self.av_v_group_size if self.av_v_group_size > 0 else D
 
-        grouped_fn = self._get_av_grouped_fn()
+        grouped_fn = self._get_matmul_fn()
 
         BH = B * H
         output = torch.zeros(BH, N, D, dtype=torch.float32, device=v.device)
@@ -911,6 +841,7 @@ class SCAttention(nn.Module):
                         i = b_idx * H + h
                         output[i] = grouped_fn(
                             attn_flat[i], v_t_flat[i],
+                            granularity="per_row",
                             group_a=G_attn, group_b=G_v,
                             mode=self.sc_mode, sc_prec=sp, config=config,
                             stoc_len=sl,
@@ -964,6 +895,7 @@ class SCAttention(nn.Module):
                     attn_sub = attn_flat[i][rows]
                     output[i, rows] = grouped_fn(
                         attn_sub, v_t_flat[i],
+                        granularity="per_row",
                         group_a=min(G_attn, len(rows)), group_b=G_v,
                         mode=self.sc_mode, sc_prec=sp, config=config,
                         stoc_len=sl,
@@ -995,7 +927,7 @@ class SCAttention(nn.Module):
         G_attn = self.av_attn_group_size if self.av_attn_group_size > 0 else N
         G_v = self.av_v_group_size if self.av_v_group_size > 0 else D
 
-        grouped_fn = self._get_av_grouped_fn()
+        grouped_fn = self._get_matmul_fn()
 
         BH = B * H
         output = torch.empty(BH, N, D, dtype=torch.float32, device=v.device)
@@ -1005,6 +937,7 @@ class SCAttention(nn.Module):
         for i in range(BH):
             output[i] = grouped_fn(
                 attn_flat[i], v_t_flat[i],
+                granularity="per_row",
                 group_a=G_attn, group_b=G_v,
                 mode=self.sc_mode, sc_prec=sc_prec, config=config,
                 stoc_len=stoc_len,

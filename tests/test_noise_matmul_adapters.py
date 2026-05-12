@@ -1,9 +1,10 @@
 """
-Unit test: compare real SC Triton kernels vs noisy surrogate adapters.
+Unit test: compare real SC Triton kernels vs noisy surrogate adapter.
 
-For each of the 4 kernel signatures used in sc_attention.py / sc_mlp.py,
-call the real kernel and the noisy adapter with IDENTICAL inputs, then
-compare:
+For each of the 4 call patterns used in sc_attention.py / sc_mlp.py,
+call the real kernel (``scmp_kernels.sc.sc_matmul`` with the appropriate
+``granularity``) and the noisy adapter (``noisy_sc_matmul``, same
+signature) with IDENTICAL inputs, then compare:
   1. shape, dtype
   2. mean, std (distribution similarity)
   3. RMSE vs exact float matmul (noise level)
@@ -29,18 +30,8 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from qdit.sc_integration.noise_matmul import (
-    noisy_sc_matmul,
-    noisy_sc_matmul_mlp,
-    noisy_sc_matmul_grouped,
-    noisy_sc_matmul_enable_batched_bipolar,
-)
-from scmp_kernels.sc import (
-    sc_matmul_enable_triton,
-    sc_matmul_enable_triton_mlp,
-    sc_matmul_grouped_enable_triton,
-    sc_matmul_enable_batched_bipolar,
-)
+from qdit.sc_integration.noise_matmul import noisy_sc_matmul
+from scmp_kernels.sc import sc_matmul
 from scmp_kernels.sc.config_helpers import make_sobol_simple_config
 
 
@@ -60,12 +51,37 @@ def _stats(name, ref, surrogate, exact):
     )
 
 
-def test_sc_matmul_enable_triton_vs_noisy():
-    """2D input projection: (BN, D_in) @ (D_out, D_in)^T"""
+def _sync():
+    if DEVICE == "cuda":
+        torch.cuda.synchronize()
+
+
+def _run_pair(name, ref_kwargs, sur_kwargs, ref_inputs, sur_inputs, exact):
+    """Time and compare a (real, surrogate) pair with matching signatures."""
+    _sync(); t0 = time.time()
+    ref = sc_matmul(*ref_inputs, **ref_kwargs)
+    _sync(); t_ref = time.time() - t0
+
+    _sync(); t0 = time.time()
+    sur = noisy_sc_matmul(*sur_inputs, **sur_kwargs)
+    _sync(); t_sur = time.time() - t0
+
+    assert ref.shape == sur.shape == exact.shape
+    assert sur.dtype == torch.float32
+    assert torch.isfinite(sur).all()
+    print(
+        _stats(name, ref, sur, exact),
+        f"t_ref={t_ref*1000:>6.1f}ms  t_sur={t_sur*1000:>6.1f}ms  "
+        f"speedup={t_ref/max(t_sur,1e-6):>5.1f}x"
+    )
+
+
+def test_sc_matmul_per_tensor_vs_noisy():
+    """2D input projection: (BN, D_in) @ (D_out, D_in)^T — granularity=per_tensor."""
     torch.manual_seed(0)
     M, D_in, D_out = 128, 1152, 1152  # DiT-XL/2 hidden_size=1152
     a = torch.randn(M, D_in, device=DEVICE, dtype=DTYPE)
-    w = torch.randn(D_out, D_in, device=DEVICE, dtype=DTYPE) * 0.05  # weight scale
+    w = torch.randn(D_out, D_in, device=DEVICE, dtype=DTYPE) * 0.05
 
     config = make_sobol_simple_config(D_in, D_in, 8)
     exact = a @ w.transpose(-2, -1)
@@ -73,39 +89,14 @@ def test_sc_matmul_enable_triton_vs_noisy():
     print()
     for L in [256, 128, 64, 32, 16]:
         sc_prec = {256:8, 128:7, 64:6, 32:5, 16:4}[L]
-        # Real
-        torch.cuda.synchronize() if DEVICE == "cuda" else None
-        t0 = time.time()
-        ref = sc_matmul_enable_triton(
-            a, w,
-            a.max().item(), a.min().item(), w.max().item(), w.min().item(),
-            mode="bipolar", sc_prec=sc_prec, config=config, stoc_len=L,
-        )
-        torch.cuda.synchronize() if DEVICE == "cuda" else None
-        t_ref = time.time() - t0
-
-        # Surrogate
-        torch.cuda.synchronize() if DEVICE == "cuda" else None
-        t0 = time.time()
-        sur = noisy_sc_matmul(
-            a, w,
-            a.max().item(), a.min().item(), w.max().item(), w.min().item(),
-            mode="bipolar", sc_prec=sc_prec, config=config, stoc_len=L,
-        )
-        torch.cuda.synchronize() if DEVICE == "cuda" else None
-        t_sur = time.time() - t0
-
-        assert ref.shape == sur.shape == exact.shape
-        assert sur.dtype == torch.float32
-        assert torch.isfinite(sur).all()
-        print(
-            _stats(f"sc_matmul_enable_triton L={L:>4d}", ref, sur, exact),
-            f"t_ref={t_ref*1000:>6.1f}ms  t_sur={t_sur*1000:>6.1f}ms  speedup={t_ref/max(t_sur,1e-6):>5.1f}x"
-        )
+        kwargs = dict(granularity="per_tensor", mode="bipolar",
+                      sc_prec=sc_prec, config=config, stoc_len=L)
+        _run_pair(f"sc_matmul per_tensor L={L:>4d}",
+                  kwargs, kwargs, (a, w), (a, w), exact)
 
 
-def test_sc_matmul_enable_triton_mlp_vs_noisy():
-    """MLP fc1: (M, D) @ (D_hidden, D)^T where D_hidden = 4*D."""
+def test_sc_matmul_per_row_mlp_vs_noisy():
+    """MLP fc1: (M, D) @ (D_hidden, D)^T — granularity=per_row, chunk_d=0."""
     torch.manual_seed(1)
     M, D_in, D_out = 128, 1152, 4608
     a = torch.randn(M, D_in, device=DEVICE, dtype=DTYPE)
@@ -117,44 +108,18 @@ def test_sc_matmul_enable_triton_mlp_vs_noisy():
     print()
     for L in [256, 64, 16]:
         sc_prec = {256:8, 64:6, 16:4}[L]
-        torch.cuda.synchronize() if DEVICE == "cuda" else None
-        t0 = time.time()
-        ref = sc_matmul_enable_triton_mlp(
-            a, w,
-            a.max().item(), a.min().item(), w.max().item(), w.min().item(),
-            mode="bipolar", sc_prec=sc_prec, config=config,
-            group_a=1, group_b=1, stoc_len=L,
-        )
-        torch.cuda.synchronize() if DEVICE == "cuda" else None
-        t_ref = time.time() - t0
-
-        torch.cuda.synchronize() if DEVICE == "cuda" else None
-        t0 = time.time()
-        sur = noisy_sc_matmul_mlp(
-            a, w,
-            a.max().item(), a.min().item(), w.max().item(), w.min().item(),
-            mode="bipolar", sc_prec=sc_prec, config=config,
-            group_a=1, group_b=1, stoc_len=L,
-        )
-        torch.cuda.synchronize() if DEVICE == "cuda" else None
-        t_sur = time.time() - t0
-
-        assert ref.shape == sur.shape == exact.shape
-        print(
-            _stats(f"sc_matmul_enable_triton_mlp L={L:>4d}", ref, sur, exact),
-            f"t_ref={t_ref*1000:>6.1f}ms  t_sur={t_sur*1000:>6.1f}ms  speedup={t_ref/max(t_sur,1e-6):>5.1f}x"
-        )
+        kwargs = dict(granularity="per_row", mode="bipolar",
+                      sc_prec=sc_prec, config=config,
+                      group_a=1, group_b=1, stoc_len=L)
+        _run_pair(f"sc_matmul per_row MLP L={L:>4d}",
+                  kwargs, kwargs, (a, w), (a, w), exact)
 
 
-def test_sc_matmul_grouped_enable_triton_vs_noisy():
-    """AV single-head: attn (N, N) @ v^T (D, N) → (N, D).
-
-    attn is softmax output (non-negative, row-sum=1).
-    """
+def test_sc_matmul_per_row_grouped_vs_noisy():
+    """AV single-head: attn (N, N) @ v^T (D, N) → (N, D)."""
     torch.manual_seed(2)
     N, D = 256, 72
     v = torch.randn(N, D, device=DEVICE, dtype=DTYPE)
-    # Softmax-like attn
     logits = torch.randn(N, N, device=DEVICE, dtype=DTYPE)
     attn = torch.softmax(logits, dim=-1)
     v_t = v.transpose(-2, -1).contiguous()  # (D, N)
@@ -165,35 +130,16 @@ def test_sc_matmul_grouped_enable_triton_vs_noisy():
     print()
     for L in [256, 64, 16]:
         sc_prec = {256:8, 64:6, 16:4}[L]
-        torch.cuda.synchronize() if DEVICE == "cuda" else None
-        t0 = time.time()
-        ref = sc_matmul_grouped_enable_triton(
-            attn, v_t,
-            group_a=1, group_b=1,
-            mode="bipolar", sc_prec=sc_prec, config=config, stoc_len=L,
-        )
-        torch.cuda.synchronize() if DEVICE == "cuda" else None
-        t_ref = time.time() - t0
-
-        torch.cuda.synchronize() if DEVICE == "cuda" else None
-        t0 = time.time()
-        sur = noisy_sc_matmul_grouped(
-            attn, v_t,
-            group_a=1, group_b=1,
-            mode="bipolar", sc_prec=sc_prec, config=config, stoc_len=L,
-        )
-        torch.cuda.synchronize() if DEVICE == "cuda" else None
-        t_sur = time.time() - t0
-
-        assert ref.shape == sur.shape == exact.shape, f"ref {ref.shape}, sur {sur.shape}, exact {exact.shape}"
-        print(
-            _stats(f"sc_matmul_grouped_enable_triton L={L:>4d}", ref, sur, exact),
-            f"t_ref={t_ref*1000:>6.1f}ms  t_sur={t_sur*1000:>6.1f}ms  speedup={t_ref/max(t_sur,1e-6):>5.1f}x"
-        )
+        kwargs = dict(granularity="per_row",
+                      group_a=1, group_b=1,
+                      mode="bipolar", sc_prec=sc_prec,
+                      config=config, stoc_len=L)
+        _run_pair(f"sc_matmul per_row grouped L={L:>4d}",
+                  kwargs, kwargs, (attn, v_t), (attn, v_t), exact)
 
 
-def test_sc_matmul_enable_batched_bipolar_vs_noisy():
-    """QK batched: (BH, N, D) @ (BH, N, D)^T → (BH, N, N)"""
+def test_sc_matmul_per_head_vs_noisy():
+    """QK batched: (BH, N, D) @ (BH, N, D)^T → (BH, N, N) — granularity=per_head."""
     torch.manual_seed(3)
     B, H, N, D = 2, 16, 256, 72
     q = torch.randn(B*H, N, D, device=DEVICE, dtype=DTYPE)
@@ -205,32 +151,10 @@ def test_sc_matmul_enable_batched_bipolar_vs_noisy():
     print()
     for L in [256, 64, 16]:
         sc_prec = {256:8, 64:6, 16:4}[L]
-        q_maxs = q.amax(dim=(1,2)); q_mins = q.amin(dim=(1,2))
-        k_maxs = k.amax(dim=(1,2)); k_mins = k.amin(dim=(1,2))
-
-        torch.cuda.synchronize() if DEVICE == "cuda" else None
-        t0 = time.time()
-        ref = sc_matmul_enable_batched_bipolar(
-            q, k, q_maxs, q_mins, k_maxs, k_mins,
-            sc_prec, config, stoc_len=L,
-        )
-        torch.cuda.synchronize() if DEVICE == "cuda" else None
-        t_ref = time.time() - t0
-
-        torch.cuda.synchronize() if DEVICE == "cuda" else None
-        t0 = time.time()
-        sur = noisy_sc_matmul_enable_batched_bipolar(
-            q, k, q_maxs, q_mins, k_maxs, k_mins,
-            sc_prec, config, stoc_len=L,
-        )
-        torch.cuda.synchronize() if DEVICE == "cuda" else None
-        t_sur = time.time() - t0
-
-        assert ref.shape == sur.shape == exact.shape, f"ref {ref.shape}, sur {sur.shape}, exact {exact.shape}"
-        print(
-            _stats(f"sc_matmul_enable_batched_bipolar L={L:>4d}", ref, sur, exact),
-            f"t_ref={t_ref*1000:>6.1f}ms  t_sur={t_sur*1000:>6.1f}ms  speedup={t_ref/max(t_sur,1e-6):>5.1f}x"
-        )
+        kwargs = dict(granularity="per_head", mode="bipolar",
+                      sc_prec=sc_prec, config=config, stoc_len=L)
+        _run_pair(f"sc_matmul per_head L={L:>4d}",
+                  kwargs, kwargs, (q, k), (q, k), exact)
 
 
 if __name__ == "__main__":
@@ -240,8 +164,8 @@ if __name__ == "__main__":
     print("        ratio = sur_rmse / ref_rmse (should be ~1.0 if surrogate is calibrated correctly)")
     print("        surrogate should be MUCH faster than real SC")
     print("=" * 180)
-    test_sc_matmul_enable_triton_vs_noisy()
-    test_sc_matmul_enable_triton_mlp_vs_noisy()
-    test_sc_matmul_grouped_enable_triton_vs_noisy()
-    test_sc_matmul_enable_batched_bipolar_vs_noisy()
+    test_sc_matmul_per_tensor_vs_noisy()
+    test_sc_matmul_per_row_mlp_vs_noisy()
+    test_sc_matmul_per_row_grouped_vs_noisy()
+    test_sc_matmul_per_head_vs_noisy()
     print("\nAll tests passed.")

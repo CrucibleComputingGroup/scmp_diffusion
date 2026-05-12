@@ -150,16 +150,13 @@ def _noisy_matmul_core(
 
     Args:
         per_row_scale:
-          * False (default): one (a_scale, b_scale) per batch — matches real
-            SC kernels that take a single max/min scalar per tensor
-            (sc_matmul, sc_matmul_enable_triton) and the batched-bipolar
-            kernel (sc_matmul_enable_batched_bipolar) that takes
-            `q_maxs = q.amax(dim=(1,2))`.
-          * True: each row of ``a`` gets its own scale, each row of ``b``
-            gets its own scale.  Matches real SC kernels called with
-            group_a=1 and group_b=1 (sc_matmul_mlp / sc_matmul_grouped
-            family). Per-row scaling gives much tighter quantization and
-            lower SC noise in practice.
+          * False (default): one (a_scale, b_scale) per batch — matches
+            ``sc_matmul`` called with ``granularity="per_tensor"`` or
+            ``"per_head"`` (single max/min per operand or per-head slice).
+          * True: each row of ``a`` and ``b`` gets its own scale. Matches
+            ``sc_matmul`` called with ``granularity="per_row"`` and
+            ``group_a=group_b=1``. Per-row scaling gives much tighter
+            quantization and lower SC noise in practice.
     """
     assert mode in ("bipolar", "unipolar"), f"unknown SC mode: {mode}"
 
@@ -192,83 +189,38 @@ def _resolve_L(stoc_len: Optional[int], sc_prec: int) -> int:
 
 
 # =============================================================================
-# Drop-in adapters — one per real kernel signature
+# Drop-in adapter — mirrors scmp_kernels.sc.sc_matmul's signature so it can
+# be swapped in directly when noise_model is enabled.
 # =============================================================================
 
-# Matches sc_matmul(...) and sc_matmul_enable_triton(...)
 @torch.no_grad()
 def noisy_sc_matmul(
     a: torch.Tensor,
     b: torch.Tensor,
-    max_fp_a: float,
-    min_fp_a: float,
-    max_fp_b: float = None,
-    min_fp_b: float = None,
+    granularity: str = "per_row",
+    *,
     mode: str = "bipolar",
     sc_prec: int = 8,
-    config: Optional[dict] = None,
     stoc_len: Optional[int] = None,
-) -> torch.Tensor:
-    return _noisy_matmul_core(a, b, L=_resolve_L(stoc_len, sc_prec), mode=mode)
-
-
-# Matches sc_matmul_mlp(...) and sc_matmul_enable_triton_mlp(...)
-@torch.no_grad()
-def noisy_sc_matmul_mlp(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    max_fp_a: float = 0.0,
-    min_fp_a: float = 0.0,
-    max_fp_b: float = None,
-    min_fp_b: float = None,
-    mode: str = "bipolar",
-    sc_prec: int = 8,
-    config: Optional[dict] = None,
-    group_a: int = 1,
-    group_b: int = 1,
     chunk_d: int = 0,
-    stoc_len: Optional[int] = None,
-) -> torch.Tensor:
-    # group_a=group_b=1 in the real kernel means per-row quantization
-    per_row = (group_a == 1 and group_b == 1)
-    return _noisy_matmul_core(
-        a, b, L=_resolve_L(stoc_len, sc_prec), mode=mode,
-        per_row_scale=per_row,
-    )
-
-
-# Matches sc_matmul_grouped(...) and sc_matmul_grouped_enable_triton(...)
-@torch.no_grad()
-def noisy_sc_matmul_grouped(
-    a: torch.Tensor,
-    b: torch.Tensor,
     group_a: int = 1,
     group_b: int = 1,
-    mode: str = "unipolar",
-    sc_prec: int = 8,
+    rng_levels: Optional[int] = None,
     config: Optional[dict] = None,
-    stoc_len: Optional[int] = None,
 ) -> torch.Tensor:
-    per_row = (group_a == 1 and group_b == 1)
+    """Surrogate matmul matching ``sc_matmul``'s signature.
+
+    Per-row scaling is used when ``granularity="per_row"`` and ``group_a ==
+    group_b == 1`` (matches the real per-row enable-signal kernel). All other
+    granularities use one global scale per operand, which lines up with the
+    per-tensor and per-head-batched kernels' single-max behaviour.
+
+    ``chunk_d``, ``rng_levels``, and ``config`` are accepted for API parity
+    but unused — the surrogate is a CLT-limit Gaussian noise model, not the
+    real Triton path.
+    """
+    per_row = (granularity == "per_row" and group_a == 1 and group_b == 1)
     return _noisy_matmul_core(
         a, b, L=_resolve_L(stoc_len, sc_prec), mode=mode,
         per_row_scale=per_row,
-    )
-
-
-# Matches sc_matmul_enable_batched_bipolar(...)
-@torch.no_grad()
-def noisy_sc_matmul_enable_batched_bipolar(
-    q_flat: torch.Tensor,
-    k_flat: torch.Tensor,
-    q_maxs: torch.Tensor,
-    q_mins: torch.Tensor,
-    k_maxs: torch.Tensor,
-    k_mins: torch.Tensor,
-    sc_prec: int,
-    config: dict,
-    stoc_len: Optional[int] = None,
-) -> torch.Tensor:
-    return _noisy_matmul_core(
-        q_flat, k_flat, L=_resolve_L(stoc_len, sc_prec), mode="bipolar"
     )

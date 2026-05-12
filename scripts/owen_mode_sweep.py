@@ -43,8 +43,8 @@ def run_mode(mode: str, inputs):
     # per-call inside _owen_scramble), but we MUST clear cached enable tables
     # and RNG sequences so the new mask is used. Cache key does not include
     # the mode, so without clear we'd see stale results.
-    from scmp_kernels import sc as sct
-    sct.clear_rng_cache()
+    from scmp_kernels.sc import sc_matmul, clear_rng_cache
+    clear_rng_cache()
     from scmp_kernels.sc.config_helpers import make_sobol_simple_config
 
     out = {}
@@ -55,9 +55,8 @@ def run_mode(mode: str, inputs):
     config = make_sobol_simple_config(x.shape[1], x.shape[1], 8)
     out["linear"] = []
     for sl in LEVELS:
-        sc = sct.sc_matmul_enable_triton(
-            x, w, x.max().item(), x.min().item(),
-            w.max().item(), w.min().item(),
+        sc = sc_matmul(
+            x, w, granularity="per_tensor",
             mode="bipolar", sc_prec=8, config=config, stoc_len=sl,
         )
         out["linear"].append(rel_err(sc, fp))
@@ -68,8 +67,8 @@ def run_mode(mode: str, inputs):
     config = make_sobol_simple_config(attn.shape[1], attn.shape[1], 8)
     out["av"] = []
     for sl in LEVELS:
-        sc = sct.sc_matmul_grouped_enable_triton(
-            attn, v.t().contiguous(),
+        sc = sc_matmul(
+            attn, v.t().contiguous(), granularity="per_row",
             group_a=attn.shape[0], group_b=v.shape[1],
             mode="bipolar", sc_prec=8, config=config, stoc_len=sl,
         )
@@ -78,15 +77,12 @@ def run_mode(mode: str, inputs):
     # qk
     q, k = inputs["qk"]
     fp = q @ k.transpose(-1, -2)
-    qmax = q.amax(dim=(1, 2))
-    qmin = q.amin(dim=(1, 2))
-    kmax = k.amax(dim=(1, 2))
-    kmin = k.amin(dim=(1, 2))
     config = make_sobol_simple_config(q.shape[2], q.shape[2], 8)
     out["qk"] = []
     for sl in LEVELS:
-        sc = sct.sc_matmul_enable_batched_bipolar(
-            q, k, qmax, qmin, kmax, kmin, 8, config, stoc_len=sl,
+        sc = sc_matmul(
+            q, k, granularity="per_head", mode="bipolar",
+            sc_prec=8, config=config, stoc_len=sl,
         )
         out["qk"].append(rel_err(sc, fp))
 

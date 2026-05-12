@@ -13,12 +13,7 @@ import os
 import torch
 
 from scmp_kernels.sc import kernels as sc_triton
-from scmp_kernels.sc import (
-    clear_rng_cache,
-    sc_matmul_enable_batched_bipolar,
-    sc_matmul_enable_triton,
-    sc_matmul_grouped_enable_triton,
-)
+from scmp_kernels.sc import sc_matmul, clear_rng_cache
 from scmp_kernels.sc.config_helpers import make_sobol_simple_config
 
 
@@ -139,8 +134,8 @@ def run_variant(variant_fn, stoc_len, seed=0):
         w = torch.randn(m, d, device="cuda", dtype=torch.float32)
         fp_lin = x @ w.t()
         cfg_lin = make_sobol_simple_config(d, d, 8)
-        sc_lin = sc_matmul_enable_triton(
-            x, w, x.max().item(), x.min().item(), w.max().item(), w.min().item(),
+        sc_lin = sc_matmul(
+            x, w, granularity="per_tensor",
             mode="bipolar", sc_prec=8, config=cfg_lin, stoc_len=stoc_len, rng_levels=None,
         )
         lin_err = rel_err(sc_lin, fp_lin)
@@ -151,8 +146,9 @@ def run_variant(variant_fn, stoc_len, seed=0):
         v = torch.randn(nn, dd, device="cuda")
         fp_av = attn @ v
         cfg_av = make_sobol_simple_config(nn, nn, 8)
-        sc_av = sc_matmul_grouped_enable_triton(
-            attn, v.t().contiguous(), group_a=nn, group_b=dd,
+        sc_av = sc_matmul(
+            attn, v.t().contiguous(), granularity="per_row",
+            group_a=nn, group_b=dd,
             mode="bipolar", sc_prec=8, config=cfg_av,
             stoc_len=stoc_len, rng_levels=None,
         )
@@ -163,11 +159,10 @@ def run_variant(variant_fn, stoc_len, seed=0):
         q = torch.randn(bh, N, D, device="cuda")
         k = torch.randn(bh, N, D, device="cuda")
         fp_qk = q @ k.transpose(-1, -2)
-        qmax = q.amax(dim=(1, 2)); qmin = q.amin(dim=(1, 2))
-        kmax = k.amax(dim=(1, 2)); kmin = k.amin(dim=(1, 2))
         cfg_qk = make_sobol_simple_config(D, D, 8)
-        sc_qk = sc_matmul_enable_batched_bipolar(
-            q, k, qmax, qmin, kmax, kmin, 8, cfg_qk,
+        sc_qk = sc_matmul(
+            q, k, granularity="per_head", mode="bipolar",
+            sc_prec=8, config=cfg_qk,
             stoc_len=stoc_len, rng_levels=None,
         )
         qk_err = rel_err(sc_qk, fp_qk)

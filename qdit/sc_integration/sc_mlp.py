@@ -25,7 +25,7 @@ from ..qLinearLayer import QLinearLayer
 from .sc_controller import SCController
 from .mp_config import classify_rows_by_metric, adaptive_classify_rows, MPDistributionLogger, MetricProfiler
 
-from scmp_kernels.sc import sc_matmul_mlp, sc_matmul_enable_triton_mlp
+from scmp_kernels.sc import sc_matmul
 from scmp_kernels.sc.config_helpers import make_sobol_simple_config
 
 
@@ -86,14 +86,12 @@ class SCMlp(nn.Module):
             self._sc_configs[key] = make_sobol_simple_config(D, D, sc_prec)
         return self._sc_configs[key]
 
-    def _get_sc_matmul_fn(self):
-        """Return the SC matmul function based on enable-signal flag."""
+    def _get_matmul_fn(self):
+        """Return the SC matmul function — real Triton path or surrogate."""
         if self.sc_controller.noise_model:
-            from .noise_matmul import noisy_sc_matmul_mlp
-            return noisy_sc_matmul_mlp
-        if self.sc_controller.sc_enable:
-            return sc_matmul_enable_triton_mlp
-        return sc_matmul_mlp
+            from .noise_matmul import noisy_sc_matmul
+            return noisy_sc_matmul
+        return sc_matmul
 
     def _rng_levels(self, stoc_len: int) -> Optional[int]:
         """Enable-signal RNG/grid size for fixed-level precision mode."""
@@ -166,25 +164,25 @@ class SCMlp(nn.Module):
                 result = result + bias
             return result.reshape(*orig_shape[:-1], -1)
 
-        matmul_fn = self._get_sc_matmul_fn()
+        matmul_fn = self._get_matmul_fn()
 
         if chunk_d > 0 and D > chunk_d:
             config = self._get_sc_config(chunk_d, sc_prec)
             result = matmul_fn(
                 x_flat, weight,
+                granularity="per_row",
                 mode=self.sc_mode, sc_prec=sc_prec, config=config,
                 group_a=1, group_b=1, chunk_d=chunk_d,
                 stoc_len=stoc_len,
-                rng_levels=self._rng_levels(stoc_len) if self.sc_controller.sc_enable else None)
+                rng_levels=self._rng_levels(stoc_len))
         else:
             config = self._get_sc_config(D, sc_prec)
             result = matmul_fn(x_flat, weight,
-                               x_flat.max().item(), x_flat.min().item(),
-                               weight.max().item(), weight.min().item(),
+                               granularity="per_row",
                                mode=self.sc_mode, sc_prec=sc_prec, config=config,
                                group_a=1, group_b=1,
                                stoc_len=stoc_len,
-                               rng_levels=self._rng_levels(stoc_len) if self.sc_controller.sc_enable else None)
+                               rng_levels=self._rng_levels(stoc_len))
 
         if bias is not None:
             result = result + bias
@@ -227,7 +225,7 @@ class SCMlp(nn.Module):
             self.sc_controller.current_timestep, self.block_idx,
             operator, assignment, M)
 
-        matmul_fn = self._get_sc_matmul_fn()
+        matmul_fn = self._get_matmul_fn()
         out_features = weight.shape[0]
         result = torch.zeros(M, out_features,
                              device=x.device, dtype=torch.float32)
@@ -250,20 +248,20 @@ class SCMlp(nn.Module):
                 config = self._get_sc_config(chunk_d, sp)
                 sub = matmul_fn(
                     x_sub, weight,
+                    granularity="per_row",
                     mode=self.sc_mode, sc_prec=sp, config=config,
                     group_a=1, group_b=1, chunk_d=chunk_d,
                     stoc_len=sl,
-                    rng_levels=self._rng_levels(sl) if self.sc_controller.sc_enable else None)
+                    rng_levels=self._rng_levels(sl))
             else:
                 config = self._get_sc_config(D, sp)
                 sub = matmul_fn(
                     x_sub, weight,
-                    x_sub.max().item(), x_sub.min().item(),
-                    weight.max().item(), weight.min().item(),
+                    granularity="per_row",
                     mode=self.sc_mode, sc_prec=sp, config=config,
                     group_a=1, group_b=1,
                     stoc_len=sl,
-                    rng_levels=self._rng_levels(sl) if self.sc_controller.sc_enable else None)
+                    rng_levels=self._rng_levels(sl))
             result[rows] = sub
 
         MPDistributionLogger.log_compute(
@@ -325,7 +323,7 @@ class SCMlp(nn.Module):
             if len(rows) > 0:
                 row_stoc_lens[rows] = sl
 
-        matmul_fn = self._get_sc_matmul_fn()
+        matmul_fn = self._get_matmul_fn()
         result = torch.zeros(M, weight.shape[0],
                              device=x.device, dtype=torch.float32)
 
@@ -358,20 +356,20 @@ class SCMlp(nn.Module):
                     config = self._get_sc_config(chunk_d, sp)
                     sub = matmul_fn(
                         x_sub, entry.weight,
+                        granularity="per_row",
                         mode=self.sc_mode, sc_prec=sp, config=config,
                         group_a=1, group_b=1, chunk_d=chunk_d,
                         stoc_len=eff_sl_val,
-                        rng_levels=self._rng_levels(eff_sl_val) if self.sc_controller.sc_enable else None)
+                        rng_levels=self._rng_levels(eff_sl_val))
                 else:
                     config = self._get_sc_config(D, sp)
                     sub = matmul_fn(
                         x_sub, entry.weight,
-                        x_sub.max().item(), x_sub.min().item(),
-                        entry.weight.max().item(), entry.weight.min().item(),
+                        granularity="per_row",
                         mode=self.sc_mode, sc_prec=sp, config=config,
                         group_a=1, group_b=1,
                         stoc_len=eff_sl_val,
-                        rng_levels=self._rng_levels(eff_sl_val) if self.sc_controller.sc_enable else None)
+                        rng_levels=self._rng_levels(eff_sl_val))
                 result[rows.unsqueeze(1), entry.out_indices.unsqueeze(0)] = sub
 
         MPDistributionLogger.log_compute(
@@ -413,7 +411,7 @@ class SCMlp(nn.Module):
         x_flat = x.reshape(-1, D)
         M = x_flat.shape[0]
 
-        matmul_fn = self._get_sc_matmul_fn()
+        matmul_fn = self._get_matmul_fn()
 
         baseline_stoc_len = self.sc_controller.stoc_len
         compute_baseline = 0
@@ -431,19 +429,19 @@ class SCMlp(nn.Module):
                 config = self._get_sc_config(chunk_d, entry.sc_prec)
                 sub = matmul_fn(
                     x_flat, entry.weight,
+                    granularity="per_row",
                     mode=self.sc_mode, sc_prec=entry.sc_prec, config=config,
                     group_a=1, group_b=1, chunk_d=chunk_d,
                     stoc_len=entry.stoc_len,
-                    rng_levels=self._rng_levels(entry.stoc_len) if self.sc_controller.sc_enable else None)
+                    rng_levels=self._rng_levels(entry.stoc_len))
             else:
                 config = self._get_sc_config(D, entry.sc_prec)
                 sub = matmul_fn(x_flat, entry.weight,
-                                x_flat.max().item(), x_flat.min().item(),
-                                entry.weight.max().item(), entry.weight.min().item(),
+                                granularity="per_row",
                                 mode=self.sc_mode, sc_prec=entry.sc_prec,
                                 config=config, group_a=1, group_b=1,
                                 stoc_len=entry.stoc_len,
-                                rng_levels=self._rng_levels(entry.stoc_len) if self.sc_controller.sc_enable else None)
+                                rng_levels=self._rng_levels(entry.stoc_len))
             result[:, entry.out_indices] = sub
 
         MPDistributionLogger.log_compute(
