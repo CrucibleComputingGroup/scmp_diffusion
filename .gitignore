@@ -11,3 +11,8 @@ __pycache__/
 *.egg-info/
 *.nsys-rep
 logs_mp_sweep/
+
+# Evaluation / ImageNet-ref large binary artifacts — code only, data lives elsewhere
+evaluation/sample_grids/
+evaluation/imagenet_ref/images/
+evaluation/imagenet_ref/*.npz
