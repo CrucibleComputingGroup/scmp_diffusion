@@ -1,0 +1,18 @@
+pretrained_models
+build
+results
+cali_data
+sd-vae-ft-mse
+Q_DiT.egg-info
+evaluations/reference_batch/*
+evaluations/classify_image_graph_def.pb
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.nsys-rep
+logs_mp_sweep/
+
+# Evaluation / ImageNet-ref large binary artifacts — code only, data lives elsewhere
+evaluation/sample_grids/
+evaluation/imagenet_ref/images/
+evaluation/imagenet_ref/*.npz
