@@ -62,6 +62,7 @@ class SCController:
         noise_global_correction: float = 0.60,
         precision_map: Optional[SCPrecisionMap] = None,
         fixed_level_sc_prec: bool = False,
+        halve: bool = False,
     ):
         # Validate parameters
         assert 0.0 <= timewise <= 1.0, f"timewise must be in [0, 1], got {timewise}"
@@ -94,6 +95,11 @@ class SCController:
         self.noise_local_correction = noise_local_correction
         self.noise_global_correction = noise_global_correction
         self.fixed_level_sc_prec = fixed_level_sc_prec
+        # Halve the bipolar SC stream length (uSystolic / HUB sign-magnitude
+        # trick): run bipolar matmuls at stoc_len/2 with no accuracy loss.
+        # Only applies to mode="bipolar"; ignored by the unipolar path and the
+        # noise surrogate.
+        self.halve = halve
         if noise_model:
             from .noise_matmul import set_noise_corrections
             set_noise_corrections(noise_local_correction, noise_global_correction)

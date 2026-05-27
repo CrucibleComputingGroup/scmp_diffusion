@@ -681,6 +681,13 @@ def create_argparser():
              'Without this flag, runtime derives sc_prec from each stoc_len via ceil(log2(stoc_len)).'
     )
     parser.add_argument(
+        '--sc_halve', action='store_true',
+        help='Halve the bipolar SC stream length (uSystolic / HUB sign-magnitude '
+             'trick): run bipolar matmuls at stoc_len/2 with no accuracy loss. '
+             'Only affects mode="bipolar" (i.e. --w_sym); ignored otherwise. '
+             'Can also be enabled via the SC_HALVE=1 env var.'
+    )
+    parser.add_argument(
         '--sc_noise_model', action='store_true',
         help='Fast simulation: replace real SC kernels with closed-form '
              'analytical Gaussian noise surrogate (exact Bernoulli variance, '
@@ -706,6 +713,12 @@ def create_argparser():
     parser.add_argument(
         '--av_v_group_size', type=int, default=1,
         help='Row group size for V in AV SC. 1=per-feature (best), D=per-tensor (current).'
+    )
+    parser.add_argument(
+        '--sc_qk_granularity', type=str, default='per_head',
+        choices=['per_head', 'per_row'],
+        help='QK SC quantization granularity. per_head (default, one scale per '
+             'attention head) or per_row (per-query-row scaling, matches AV).'
     )
     parser.add_argument(
         '--sc_config', type=str, default=None,

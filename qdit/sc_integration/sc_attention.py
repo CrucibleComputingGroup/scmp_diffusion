@@ -14,6 +14,7 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from dataclasses import dataclass
+from functools import partial
 from typing import Optional
 
 import torch
@@ -100,6 +101,11 @@ class SCAttention(nn.Module):
         self.av_attn_group_size = getattr(args, 'av_attn_group_size', 1)
         self.av_v_group_size = getattr(args, 'av_v_group_size', 1)
 
+        # QK quantization granularity. Default "per_head" (one scale per
+        # attention head, fully batched). Set "per_row" for per-query-row
+        # scaling — matches the AV path's granularity.
+        self.qk_granularity = getattr(args, 'sc_qk_granularity', 'per_head')
+
         # SC config cache keyed by (D, sc_prec), created on first use
         self._sc_configs = {}
 
@@ -157,6 +163,9 @@ class SCAttention(nn.Module):
         if self.sc_controller.noise_model:
             from .noise_matmul import noisy_sc_matmul
             return noisy_sc_matmul
+        if getattr(self.sc_controller, "halve", False):
+            # uSystolic / HUB stoc_len/2 trick; no-op for non-bipolar modes.
+            return partial(sc_matmul, halve_bipolar_stoc_len=True)
         return sc_matmul
 
     def _rng_levels(self, stoc_len: int) -> Optional[int]:
@@ -748,10 +757,13 @@ class SCAttention(nn.Module):
 
         matmul_fn = self._get_matmul_fn()
 
-        # Fast path: fully batched kernel via granularity="per_head"
+        # Fast path: fully batched kernel. Default granularity is per_head (one
+        # scale per attention head); --sc_qk_granularity=per_row switches to
+        # per-query-row scaling, matching the AV path. Both run batched on the
+        # (B*H, N, D) layout.
         if self.sc_mode == "bipolar":
             output = matmul_fn(
-                q_flat, k_flat, granularity="per_head", mode="bipolar",
+                q_flat, k_flat, granularity=self.qk_granularity, mode="bipolar",
                 sc_prec=sc_prec, config=config, stoc_len=stoc_len,
                 rng_levels=self._rng_levels(stoc_len),
             )

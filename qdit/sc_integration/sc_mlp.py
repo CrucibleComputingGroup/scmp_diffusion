@@ -14,6 +14,7 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from dataclasses import dataclass
+from functools import partial
 from typing import Optional
 
 import torch
@@ -91,6 +92,9 @@ class SCMlp(nn.Module):
         if self.sc_controller.noise_model:
             from .noise_matmul import noisy_sc_matmul
             return noisy_sc_matmul
+        if getattr(self.sc_controller, "halve", False):
+            # uSystolic / HUB stoc_len/2 trick; no-op for non-bipolar modes.
+            return partial(sc_matmul, halve_bipolar_stoc_len=True)
         return sc_matmul
 
     def _rng_levels(self, stoc_len: int) -> Optional[int]:
