@@ -145,6 +145,7 @@ def _cosine_dist_heads(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor
 _METRIC_ROWS = _relative_l2_rows
 _METRIC_HEADS = _relative_l2_heads
 _USE_FP_TEACHER = False
+_SC_HALVE = False  # bipolar sign-magnitude halving during calibration probes
 
 
 def _save_fp_weights(model) -> None:
@@ -337,6 +338,12 @@ class ThresholdCalibrator:
         # group's pre-subsample row count R_g, used for the R_g-weighted global lambda.
         self.budget_scope = budget_scope
         self.true_counts: dict[tuple[str, int, int], int] = defaultdict(int)
+        # Per-operator MACs-per-row (out_features x in_features for linears,
+        # N x head_dim for qk/av). The GLOBAL budget prices each row by
+        # macs_per_row, so the budget is FLOP-weighted rather than row-weighted:
+        # a target avg stoc_len then means that value in real compute, not per
+        # row. Set once per operator by add(); constant across its rows.
+        self.op_macs: dict[str, float] = {}
         self._rng = np.random.default_rng(rng_seed)
         # Optional full-resolution log keyed by raw (operator, block_idx, timestep) so the
         # bucketing can be re-derived offline (any timestep/layer_buckets) without re-probing.
@@ -365,9 +372,14 @@ class ThresholdCalibrator:
         timestep: int,
         metric_norm: torch.Tensor,
         errors_by_level: list[torch.Tensor],
+        macs_per_row: float = 1.0,
     ):
         if not self.should_record(operator, block_idx, timestep):
             return
+
+        # Record this operator's per-row MAC cost (constant across its rows) so
+        # the global budget can weight rows by FLOPs, not just row count.
+        self.op_macs[operator] = float(macs_per_row)
 
         metrics = metric_norm.detach().float().reshape(-1).cpu().numpy()
         err = torch.stack([e.detach().float().reshape(-1) for e in errors_by_level], dim=-1)
@@ -475,14 +487,20 @@ class ThresholdCalibrator:
         # independently pinned to budget_ratio*ref -- original behaviour).
         global_lam = None
         if self.budget_scope == "global":
-            werrs, row_counts = [], []
+            werrs, flop_counts = [], []
             for key, rec in self.records.items():
                 e = np.concatenate(rec["errors"], axis=0)
                 werrs.append(e)
-                row_counts.append(float(self.true_counts.get(key, e.shape[0])))
+                R = float(self.true_counts.get(key, e.shape[0]))
+                # FLOP-weighted budget: price each true row by macs_per_row so
+                # cheap-but-numerous ops (per-head-per-row av/qk) can't dominate
+                # the budget over few-but-expensive linear rows. _global_lambda
+                # treats the passed counts as the budget/cost weights, so passing
+                # R*macs makes the realized average FLOP-weighted.
+                flop_counts.append(R * self.op_macs.get(key[0], 1.0))
             global_lam = _global_lambda(
                 werrs, self.costs, self.budget_ratio,
-                float(self.budget_ref_stoc_len), row_counts)
+                float(self.budget_ref_stoc_len), flop_counts)
             payload["global_lambda"] = float(global_lam)
 
         for operator in sorted(self.operators):
@@ -497,7 +515,8 @@ class ThresholdCalibrator:
                 fitted = self._fit_group(
                     np.concatenate(op_metrics, axis=0),
                     np.concatenate(op_errors, axis=0),
-                    lam=global_lam, weight=1.0, rep=self._rep_for_op(operator),
+                    lam=global_lam, weight=1.0,
+                    rep=self._rep_for_op(operator) * self.op_macs.get(operator, 1.0),
                 )
                 payload["operator_defaults"][operator] = fitted
                 summary_rows.append(
@@ -518,8 +537,9 @@ class ThresholdCalibrator:
             if metrics.size < self.min_bucket_units:
                 continue
             operator, t_bucket, l_bucket = key
-            fitted = self._fit_group(metrics, errors, lam=global_lam,
-                                     weight=1.0, rep=self._rep_for_key(key))
+            fitted = self._fit_group(
+                metrics, errors, lam=global_lam, weight=1.0,
+                rep=self._rep_for_key(key) * self.op_macs.get(key[0], 1.0))
             bucket_key = f"{operator}:t{t_bucket}:l{l_bucket}"
             payload["buckets"][bucket_key] = fitted
             summary_rows.append(
@@ -532,16 +552,19 @@ class ThresholdCalibrator:
                 }
             )
 
-        # Honest iso-budget check: row-weighted (R_g) average stoc_len across all
-        # buckets. For per_bucket this is ~budget_ratio*ref by construction; for
-        # global it's the realized average -- should also land near the target.
+        # Honest iso-budget check: FLOP-weighted (R_g * macs_g) average stoc_len
+        # across all buckets. For global scope this is the realized compute
+        # average -- should land near the target (unlike the old row-weighted
+        # average, which under-counted the FLOP-heavy linears).
+        payload["op_macs"] = dict(self.op_macs)
         num = den = 0.0
         for bkey, fitted in payload["buckets"].items():
             op, tpart, lpart = bkey.split(":")
             k = (op, int(tpart[1:]), int(lpart[1:]))
             R = float(self.true_counts.get(k, fitted["num_units"]))
-            num += R * fitted["avg_stoc_len"]
-            den += R
+            w = R * self.op_macs.get(op, 1.0)
+            num += w * fitted["avg_stoc_len"]
+            den += w
         payload["expected_avg_stoc_len"] = (num / den) if den else 0.0
 
         return payload, summary_rows
@@ -605,6 +628,7 @@ def _run_attention_linear_level(
                     chunk_d=chunk_d,
                     stoc_len=stoc_len,
                     rng_levels=rng_levels,
+                    halve_bipolar_stoc_len=_SC_HALVE,
                 )
                 result = chunk_result if result is None else result + chunk_result
         else:
@@ -620,6 +644,7 @@ def _run_attention_linear_level(
                     group_b=1,
                     stoc_len=stoc_len,
                     rng_levels=rng_levels,
+                    halve_bipolar_stoc_len=_SC_HALVE,
                 )
 
         if bias is not None:
@@ -674,6 +699,7 @@ def _run_mlp_linear_level(
                 chunk_d=chunk_d,
                 stoc_len=stoc_len,
                 rng_levels=rng_levels,
+                halve_bipolar_stoc_len=_SC_HALVE,
             )
             result = chunk_result if result is None else result + chunk_result
     else:
@@ -690,6 +716,7 @@ def _run_mlp_linear_level(
             chunk_d=chunk_d,
             stoc_len=stoc_len,
             rng_levels=rng_levels,
+            halve_bipolar_stoc_len=_SC_HALVE,
         )
     if bias is not None:
         result = result + bias
@@ -758,7 +785,9 @@ class CalibrationRunner:
                             teacher_qkv.float().reshape(-1, teacher_qkv.shape[-1]),
                         )
                     )
-                self.calibrator.add("input_proj", block_idx, timestep, row_metric, level_errors)
+                self.calibrator.add(
+                    "input_proj", block_idx, timestep, row_metric, level_errors,
+                    macs_per_row=float(module.qkv.weight.shape[0] * module.qkv.weight.shape[1]))
             else:
                 if _USE_FP_TEACHER:
                     x_for_teacher = (torch.index_select(x, 2, module.reorder_index_qkv)
@@ -784,16 +813,32 @@ class CalibrationRunner:
             teacher_attn = (q_scaled @ k.transpose(-2, -1))
 
             if self.calibrator.should_record("qk", block_idx, timestep):
-                q_metric = _normalize_metric(q_scaled.float().abs().amax(dim=(0, 2, 3)))
-                level_errors = []
+                # Per-query-row recording — matches the runtime per-row qk MP
+                # (rows classified by ||Q_row||_inf), mirroring the av path.
+                q_flat = q_scaled.reshape(-1, q_scaled.shape[-2], q_scaled.shape[-1])
+                teacher_flat = teacher_attn.reshape(
+                    -1, teacher_attn.shape[-2], teacher_attn.shape[-1])
+                qk_errors_by_level: list[list[torch.Tensor]] = [[] for _ in self.calibrator.levels]
                 for sl in self.calibrator.levels:
                     if sl == 0:
                         sc_attn = torch.zeros_like(teacher_attn, dtype=torch.float32)
                     else:
                         sc_prec = _resolve_level_sc_prec(module, sl)
                         sc_attn = module._sc_qk_uniform(q, k, sc_prec, sl).float()
-                    level_errors.append(_METRIC_HEADS(sc_attn, teacher_attn.float()))
-                self.calibrator.add("qk", block_idx, timestep, q_metric, level_errors)
+                    sc_flat = sc_attn.reshape(-1, sc_attn.shape[-2], sc_attn.shape[-1])
+                    for i in range(sc_flat.shape[0]):
+                        qk_errors_by_level[self.calibrator.levels.index(sl)].append(
+                            _METRIC_ROWS(sc_flat[i], teacher_flat[i].float())
+                        )
+                qk_macs = float(n_tokens * module.head_dim)
+                for i in range(q_flat.shape[0]):
+                    row_metric = _normalize_metric(q_flat[i].abs().amax(dim=-1))
+                    level_errors = [
+                        qk_errors_by_level[level_idx][i]
+                        for level_idx in range(len(self.calibrator.levels))
+                    ]
+                    self.calibrator.add("qk", block_idx, timestep, row_metric,
+                                        level_errors, macs_per_row=qk_macs)
 
             attn = module.attn_drop(teacher_attn.softmax(dim=-1))
             teacher_av = (attn @ v)
@@ -820,7 +865,9 @@ class CalibrationRunner:
                         level_errors_by_level[level_idx][i]
                         for level_idx in range(len(self.calibrator.levels))
                     ]
-                    self.calibrator.add("av", block_idx, timestep, row_metric, level_errors)
+                    self.calibrator.add(
+                        "av", block_idx, timestep, row_metric, level_errors,
+                        macs_per_row=float(module.head_dim * n_tokens))
 
             proj_hidden = module.num_heads * module.head_dim
             proj_in = teacher_av.transpose(1, 2).reshape(bsz, n_tokens, proj_hidden)
@@ -850,7 +897,9 @@ class CalibrationRunner:
                             teacher_proj.float().reshape(-1, teacher_proj.shape[-1]),
                         )
                     )
-                self.calibrator.add("proj", block_idx, timestep, row_metric, level_errors)
+                self.calibrator.add(
+                    "proj", block_idx, timestep, row_metric, level_errors,
+                    macs_per_row=float(module.proj.weight.shape[0] * module.proj.weight.shape[1]))
 
     def _mlp_hook(self, module, inputs, _output):
         timestep = module.sc_controller.current_timestep
@@ -887,7 +936,9 @@ class CalibrationRunner:
                             teacher_fc1.float().reshape(-1, teacher_fc1.shape[-1]),
                         )
                     )
-                self.calibrator.add("mlp_fc1", block_idx, timestep, row_metric, level_errors)
+                self.calibrator.add(
+                    "mlp_fc1", block_idx, timestep, row_metric, level_errors,
+                    macs_per_row=float(module.fc1.weight.shape[0] * module.fc1.weight.shape[1]))
             else:
                 if _USE_FP_TEACHER:
                     x_for_teacher = (torch.index_select(x, 2, module.reorder_index_fc1)
@@ -919,7 +970,9 @@ class CalibrationRunner:
                             teacher_fc2.float().reshape(-1, teacher_fc2.shape[-1]),
                         )
                     )
-                self.calibrator.add("mlp_fc2", block_idx, timestep, row_metric, level_errors)
+                self.calibrator.add(
+                    "mlp_fc2", block_idx, timestep, row_metric, level_errors,
+                    macs_per_row=float(module.fc2.weight.shape[0] * module.fc2.weight.shape[1]))
 
     def register_hooks(self):
         hooks = []
@@ -1111,11 +1164,13 @@ def main():
     model = quantize_sc_model(model, device, args, sc_controller=sc_controller)
 
     # Wire metric + teacher dispatch globals.
-    global _METRIC_ROWS, _METRIC_HEADS, _USE_FP_TEACHER
+    global _METRIC_ROWS, _METRIC_HEADS, _USE_FP_TEACHER, _SC_HALVE
     if args.metric == "cosine":
         _METRIC_ROWS = _cosine_dist_rows
         _METRIC_HEADS = _cosine_dist_heads
     _USE_FP_TEACHER = (args.teacher == "fp")
+    _SC_HALVE = bool(args.sc_halve)
+    print(f"SC halve during calibration: {_SC_HALVE}")
     print(f"Calibration metric: {args.metric}, teacher: {args.teacher}")
     model.to(device)
     model.eval().half()

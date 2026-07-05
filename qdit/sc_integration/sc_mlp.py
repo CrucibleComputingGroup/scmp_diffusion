@@ -209,12 +209,12 @@ class SCMlp(nn.Module):
         if self.sc_controller.adaptive_mp_config is not None:
             assignment = adaptive_classify_rows(
                 row_metric,
-                self.sc_controller.current_timestep,
-                self.sc_controller.total_timesteps,
                 self.sc_controller.adaptive_mp_config,
                 operator=operator,
                 block_idx=self.block_idx,
                 total_blocks=self.sc_controller.total_blocks,
+                timestep=self.sc_controller.current_timestep,
+                total_timesteps=self.sc_controller.total_timesteps,
             )
         else:
             mp_config = self.sc_controller.mp_config
@@ -295,12 +295,12 @@ class SCMlp(nn.Module):
         if self.sc_controller.adaptive_mp_config is not None:
             assignment = adaptive_classify_rows(
                 row_metric,
-                self.sc_controller.current_timestep,
-                self.sc_controller.total_timesteps,
                 self.sc_controller.adaptive_mp_config,
                 operator=operator,
                 block_idx=self.block_idx,
                 total_blocks=self.sc_controller.total_blocks,
+                timestep=self.sc_controller.current_timestep,
+                total_timesteps=self.sc_controller.total_timesteps,
             )
         else:
             mp_config = self.sc_controller.mp_config

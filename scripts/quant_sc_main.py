@@ -424,20 +424,12 @@ def main():
         quant_string_name += "_fixlvlprec"
     if args.sc_noise_model:
         quant_string_name += "_noisemodel"
-    # Append per-operator MP alpha/beta to folder name when adaptive_mp is used
+    # Tag the folder name with the calibrated MP table when adaptive_mp is used
     if getattr(args, 'adaptive_mp', False) or getattr(args, 'adaptive_mp_table', None):
-        _mp_parts = []
-        for _op in ["qk", "av", "proj", "input_proj", "mlp_fc1", "mlp_fc2"]:
-            _a = getattr(args, f"mp_alpha_{_op}", None)
-            _b = getattr(args, f"mp_beta_{_op}", None)
-            if _a is not None and _b is not None:
-                _mp_parts.append(f"{_op}_a{_a}_b{_b}")
         if getattr(args, 'adaptive_mp_table', None):
             quant_string_name += f"_mptbl_{Path(args.adaptive_mp_table).stem}"
-        elif _mp_parts:
-            quant_string_name += "_mp_" + "_".join(_mp_parts)
         else:
-            quant_string_name += f"_mp_a{args.mp_alpha}_b{args.mp_beta}"
+            quant_string_name += "_adaptivemp"
     if getattr(args, 'range_mp', False):
         _rmp_parts = []
         for _op in ["qk", "av", "proj", "input_proj", "mlp"]:
@@ -545,44 +537,20 @@ def main():
 
     # Initialize mixed precision if requested
     if args.adaptive_mp or args.adaptive_mp_table:
+        if not args.adaptive_mp_table:
+            raise ValueError(
+                "--adaptive_mp requires --adaptive_mp_table (a calibrated "
+                "threshold table from calibrate_mp_thresholds.py). The old "
+                "closed-form alpha/beta fallback has been removed.")
         levels = [int(x) for x in args.mp_levels.split(',')]
-        # Build per-operator overrides (None means use global default)
-        operator_params = {}
-        # Lookup order: exact op name → group key → global
-        for op, group_key in [("qk", "qk"), ("av", "av"),
-                               ("mlp_fc1", "mlp_fc1"), ("mlp_fc2", "mlp_fc2"),
-                               ("input_proj", "input_proj"), ("proj", "proj")]:
-            # Try exact op-level arg first, then group-level fallback
-            a = getattr(args, f"mp_alpha_{op}", None)
-            b = getattr(args, f"mp_beta_{op}", None)
-            if a is None:
-                # Group fallback: mlp_fc1/mlp_fc2 → mlp
-                group_fallback = {"mlp_fc1": "mlp", "mlp_fc2": "mlp"}.get(op)
-                if group_fallback:
-                    a = getattr(args, f"mp_alpha_{group_fallback}", None)
-            if b is None:
-                group_fallback = {"mlp_fc1": "mlp", "mlp_fc2": "mlp"}.get(op)
-                if group_fallback:
-                    b = getattr(args, f"mp_beta_{group_fallback}", None)
-            if a is not None or b is not None:
-                operator_params[op] = (
-                    a if a is not None else args.mp_alpha,
-                    b if b is not None else args.mp_beta,
-                )
-
         adaptive_config = AdaptiveMPConfig(
             stoc_len_levels=levels,
-            alpha=args.mp_alpha,
-            beta=args.mp_beta,
             enable_pruning=args.mp_enable_pruning,
-            operator_params=operator_params,
             threshold_table_path=args.adaptive_mp_table,
         )
         sc_controller.init_adaptive_mp(adaptive_config)
-        logging.info(f"Adaptive mixed precision V2 enabled: levels={levels}, "
-                     f"alpha={args.mp_alpha}, beta={args.mp_beta}, "
+        logging.info(f"Adaptive mixed precision enabled: levels={levels}, "
                      f"pruning={args.mp_enable_pruning}, "
-                     f"operator_params={operator_params}, "
                      f"threshold_table={args.adaptive_mp_table}")
     elif args.mp:
         levels = [int(x) for x in args.mp_levels.split(',')]
@@ -744,25 +712,17 @@ def create_argparser():
         help='Comma-separated fractions per level (default: equal). E.g. "0.1,0.2,0.3,0.4".'
     )
 
-    # Adaptive mixed precision (timestep-aware, inspired by APT)
+    # Adaptive mixed precision (calibrated per-row thresholds)
     parser.add_argument(
         '--adaptive_mp', action='store_true',
-        help='Enable adaptive mixed precision with timestep-aware thresholds.'
+        help='Enable adaptive mixed precision. Requires --adaptive_mp_table '
+             '(a calibrated threshold table); there is no closed-form fallback.'
     )
     parser.add_argument(
         '--adaptive_mp_table', type=str, default=None,
-        help='Path to a calibrated adaptive-MP threshold JSON table. '
-             'When provided, runtime classification uses operator/timestep/layer '
-             'bucket thresholds from the table and falls back to alpha/beta only '
-             'for operators missing from the table.'
-    )
-    parser.add_argument(
-        '--mp_alpha', type=float, default=0.3,
-        help='Adaptive MP: threshold sensitivity to timestep progress.'
-    )
-    parser.add_argument(
-        '--mp_beta', type=float, default=0.05,
-        help='Adaptive MP: base threshold offset.'
+        help='Path to a calibrated adaptive-MP threshold JSON table from '
+             'calibrate_mp_thresholds.py. Runtime classification uses the '
+             'per-(operator, timestep, layer) bucket thresholds from the table.'
     )
     parser.add_argument(
         '--mp_enable_pruning', action='store_true', default=True,
@@ -772,64 +732,6 @@ def create_argparser():
         '--no_mp_pruning', dest='mp_enable_pruning', action='store_false',
         help='Adaptive MP: disable row pruning.'
     )
-    # Per-operator alpha/beta overrides
-    parser.add_argument(
-        '--mp_alpha_qk', type=float, default=None,
-        help='Per-operator alpha for QK (default: use --mp_alpha).'
-    )
-    parser.add_argument(
-        '--mp_alpha_av', type=float, default=None,
-        help='Per-operator alpha for AV (default: use --mp_alpha).'
-    )
-    parser.add_argument(
-        '--mp_alpha_mlp', type=float, default=None,
-        help='Per-operator alpha for MLP fc1/fc2 (default: use --mp_alpha).'
-    )
-    parser.add_argument(
-        '--mp_alpha_proj', type=float, default=None,
-        help='Per-operator alpha for proj (default: use --mp_alpha).'
-    )
-    parser.add_argument(
-        '--mp_alpha_input_proj', type=float, default=None,
-        help='Per-operator alpha for input_proj (default: fallback to --mp_alpha_proj, then --mp_alpha).'
-    )
-    parser.add_argument(
-        '--mp_alpha_mlp_fc1', type=float, default=None,
-        help='Per-operator alpha for mlp_fc1 (default: fallback to --mp_alpha_mlp, then --mp_alpha).'
-    )
-    parser.add_argument(
-        '--mp_alpha_mlp_fc2', type=float, default=None,
-        help='Per-operator alpha for mlp_fc2 (default: fallback to --mp_alpha_mlp, then --mp_alpha).'
-    )
-    parser.add_argument(
-        '--mp_beta_qk', type=float, default=None,
-        help='Per-operator beta for QK (default: use --mp_beta).'
-    )
-    parser.add_argument(
-        '--mp_beta_av', type=float, default=None,
-        help='Per-operator beta for AV (default: use --mp_beta).'
-    )
-    parser.add_argument(
-        '--mp_beta_mlp', type=float, default=None,
-        help='Per-operator beta for MLP fc1/fc2 (default: use --mp_beta).'
-    )
-    parser.add_argument(
-        '--mp_beta_proj', type=float, default=None,
-        help='Per-operator beta for proj (default: use --mp_beta).'
-    )
-    parser.add_argument(
-        '--mp_beta_input_proj', type=float, default=None,
-        help='Per-operator beta for input_proj (default: fallback to --mp_beta_proj, then --mp_beta).'
-    )
-    parser.add_argument(
-        '--mp_beta_mlp_fc1', type=float, default=None,
-        help='Per-operator beta for mlp_fc1 (default: fallback to --mp_beta_mlp, then --mp_beta).'
-    )
-    parser.add_argument(
-        '--mp_beta_mlp_fc2', type=float, default=None,
-        help='Per-operator beta for mlp_fc2 (default: fallback to --mp_beta_mlp, then --mp_beta).'
-    )
-
     # Range-based mixed precision (weight min/max range)
     parser.add_argument(
         '--range_mp', action='store_true',
