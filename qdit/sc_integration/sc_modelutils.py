@@ -6,6 +6,7 @@ stochastic computing for specified operations.
 """
 
 import copy
+import os
 import torch
 import torch.nn as nn
 from tqdm import tqdm
@@ -239,6 +240,8 @@ def create_sc_controller_from_args(args, model) -> SCController:
         noise_global_correction=getattr(args, 'sc_noise_global_correction', 0.60),
         precision_map=precision_map,
         fixed_level_sc_prec=getattr(args, 'sc_fixed_level_prec', False),
+        halve=(getattr(args, 'sc_halve', False)
+               or os.environ.get('SC_HALVE', '').lower() in ('1', 'true', 'yes')),
     )
 
     # Save effective config if requested
