@@ -1,0 +1,45 @@
+#!/bin/bash
+#SBATCH --job-name=opfreeze
+#SBATCH --partition=gpu-rtx6000
+#SBATCH --account=nbleier_owned1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-gpu=4
+#SBATCH --mem-per-gpu=16G
+#SBATCH --time=04:00:00
+#
+# Op-freeze sensitivity probe: all ops at the avg48 FLOP-halve budget EXCEPT one
+# op forced to stoc_len 256 (frozen-to-FP-precision table). Generates the same
+# indices 0-63 (seed-matched to FP & the avg48 baseline) so PSNR-vs-FP is paired.
+# Usage: sbatch sbatch_opfreeze_probe.sb <OP>   (OP in qk av input_proj proj mlp_fc1 mlp_fc2)
+set -uo pipefail
+OP="${1:?usage: sbatch sbatch_opfreeze_probe.sb <OP>}"
+REPO=/gpfs/accounts/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_diffusion
+SCRATCH=/scratch/nbleier_owned_root/nbleier_owned1/zhkangqi
+CKPT=$SCRATCH/pretrained_models/DiT-XL-2-256x256.pt
+CALIB=$SCRATCH/scmp_diffusion_fid_mp_cfg15/calib_opfreeze_avg48/freeze_${OP}.json
+PROBE=$SCRATCH/scmp_diffusion_opfreeze_avg48
+OUT=$PROBE/freeze_${OP}; SAMPLES=$OUT/samples; LOG=$OUT/_logs
+IDXF="${2:-$PROBE/idx_0_23.txt}"
+N=$(grep -c . "$IDXF")
+BALANCED=10000; BATCH=$N; STEPS=50; CFG=1.5; SEED=0; NUM_CLASSES=1000
+MP_LEVELS=256,192,128,96,64,48,32,16
+mkdir -p "$SAMPLES" "$LOG"
+[[ -f "$CALIB" ]] || { echo "ERROR: missing calib $CALIB" >&2; exit 1; }
+[[ -s "$IDXF"  ]] || { echo "ERROR: missing index file $IDXF" >&2; exit 1; }
+source /home/zhkangqi/miniconda3/etc/profile.d/conda.sh; conda activate qdit
+export SC_OWEN_MODE=bitrev PYTHONUNBUFFERED=1 OMP_NUM_THREADS=4; cd "$REPO"
+have(){ find "$SAMPLES" -maxdepth 1 -name '[0-9][0-9][0-9][0-9][0-9][0-9].png' | wc -l; }
+echo "=== opfreeze OP=$OP start=$(have)/$N job=${SLURM_JOB_ID:-?} $(date) ==="
+if [[ "$(have)" -ge "$N" ]]; then echo "[complete] $OP already at $N"; exit 0; fi
+CUDA_VISIBLE_DEVICES=0 python -u scripts/quant_sc_main.py \
+    --wbits 8 --abits 8 --w_sym --a_sym \
+    --timewise 1 --qklayerwise 1.0 --avlayerwise 1.0 --projlayerwise 1.0 --mlplayerwise 1.0 --inputprojlayerwise 1.0 \
+    --sc_prec 8 --sc_fixed_level_prec --sc_qk_granularity per_row --sc_halve \
+    --adaptive_mp --adaptive_mp_table "$CALIB" --mp_levels "$MP_LEVELS" \
+    --image-size 256 --num-sampling-steps "$STEPS" --cfg-scale "$CFG" --batch-size "$BATCH" \
+    --generate-fid-samples --balanced_classes --num-classes "$NUM_CLASSES" \
+    --balanced_total_samples "$BALANCED" --num-fid-samples "$BALANCED" \
+    --target_indices_path "$IDXF" --samples_dir_override "$SAMPLES" \
+    --seed "$SEED" --results-dir "$LOG" --ckpt "$CKPT" \
+    2>&1 | tee "$LOG/run.log"
+echo "=== opfreeze OP=$OP done=$(have)/$N $(date) ==="

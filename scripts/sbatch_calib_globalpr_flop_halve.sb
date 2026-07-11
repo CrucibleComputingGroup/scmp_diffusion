@@ -1,0 +1,33 @@
+#!/bin/bash
+#SBATCH --job-name=calib_flopH
+#SBATCH --partition=gpu-rtx6000
+#SBATCH --account=nbleier_owned1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-gpu=8
+#SBATCH --mem=110G
+#SBATCH --time=03:00:00
+# FLOP-weighted + HALVE per-row GLOBAL calibration for one budget (fix branch:
+# fix/flop-cost-perrow-qk-drop-alphabeta). Matches the halve MP deployment.
+# Usage: sbatch sbatch_calib_globalpr_flop_halve.sb <AVG> <BUDGET_RATIO>
+set -uo pipefail
+AVG="${1:?AVG}"; BR="${2:?BUDGET_RATIO}"
+REPO=/gpfs/accounts/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_diffusion
+SCRATCH=/scratch/nbleier_owned_root/nbleier_owned1/zhkangqi
+CKPT=$SCRATCH/pretrained_models/DiT-XL-2-256x256.pt
+OUTDIR=$SCRATCH/scmp_diffusion_fid_mp_cfg15/calib_global_perrow_flop_halve
+source /home/zhkangqi/miniconda3/etc/profile.d/conda.sh; conda activate qdit
+export PYTHONUNBUFFERED=1 SC_OWEN_MODE=bitrev; cd "$REPO"; mkdir -p "$OUTDIR"
+echo "=== FLOP+HALVE calib GLOBAL per-row avg${AVG} br=${BR} branch=$(git branch --show-current) $(date) ==="
+python -u scripts/calibrate_mp_thresholds.py \
+    --mp_levels 256,192,128,96,64,48,32,16 \
+    --budget_ratio "$BR" --budget_ref_stoc_len 256 --budget_scope global \
+    --metric cosine --teacher fp \
+    --sc_prec 8 --sc_fixed_level_prec --sc_qk_granularity per_row \
+    --wbits 8 --abits 8 --w_sym --a_sym \
+    --image-size 256 --num-sampling-steps 50 \
+    --num_calib_batches 1 --num_calib_timesteps 50 \
+    --timestep_buckets 10 --layer_buckets 4 \
+    --sc_halve --teacher_cfg_scale 0.0 --ckpt "$CKPT" \
+    --calib_output_json "$OUTDIR/calib_fix_avg${AVG}.json" \
+    --calib_summary_csv "$OUTDIR/calib_fix_avg${AVG}_summary.csv" 2>&1 | tee "$OUTDIR/calib_avg${AVG}.log"
+echo "DONE avg${AVG} $(date)"
