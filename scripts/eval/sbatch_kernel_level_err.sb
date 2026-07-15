@@ -1,0 +1,61 @@
+#!/bin/bash
+#SBATCH --job-name=kern_lvl_err
+#SBATCH --partition=gpu-rtx6000
+#SBATCH --account=nbleier_owned1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-gpu=4
+#SBATCH --mem=24G
+#SBATCH --time=00:15:00
+# Kernel-level SC error vs stoc_len under halve: is L=128 anomalously bad?
+# Random matrices, per-row bipolar, qk-like and mlp-like shapes, mixed-level
+# calls in one process (cache interactions included, like MP dispatch does).
+set -uo pipefail
+REPO=/gpfs/accounts/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_diffusion
+S=/scratch/nbleier_owned_root/nbleier_owned1/zhkangqi
+WORK=$S/scmp_diffusion_fid_mp_globalpr_flop_halve128_cfg15/_dist_probe
+source /home/zhkangqi/miniconda3/etc/profile.d/conda.sh; conda activate qdit
+export SC_OWEN_MODE=bitrev PYTHONUNBUFFERED=1; cd "$REPO"
+exec > >(tee "$WORK/kernel_level_err.log") 2>&1
+python - << 'EOF'
+import torch
+from scmp_kernels.sc.matmul import sc_matmul
+
+torch.manual_seed(0)
+dev = "cuda"
+
+def rel_err(out, exact):
+    return ((out - exact).norm() / exact.norm()).item()
+
+# (name, N, M, D): a is (N, D), b is (M, D), product a @ b.T
+SHAPES = [
+    ("qk-like (256x256, D=72)", 256, 256, 72),
+    ("av-like (256x72, D=256)", 256, 72, 256),
+    ("mlp-like (512x4608, D=1152, chunk144)", 512, 4608, 1152),
+]
+LEVELS = [32, 48, 64, 96, 128]
+
+for name, N, M, D in SHAPES:
+    a = torch.randn(N, D, device=dev)
+    b = torch.randn(M, D, device=dev)
+    exact = a @ b.T
+    chunk = 144 if D > 1024 else 0
+    print(f"=== {name} ===")
+    # halve ON, ascending then repeated (cache warm) order
+    for tag, levels in (("halve asc ", LEVELS), ("halve rpt ", LEVELS)):
+        errs = []
+        for sl in levels:
+            out = sc_matmul(a, b, granularity="per_row", mode="bipolar",
+                            sc_prec=8, stoc_len=sl, group_a=1, group_b=1,
+                            chunk_d=chunk, halve_bipolar_stoc_len=True)
+            errs.append(f"{sl}:{rel_err(out, exact):.4f}")
+        print(f"  {tag}: " + "  ".join(errs))
+    # halve OFF reference at same lengths + 256
+    errs = []
+    for sl in LEVELS + [256]:
+        out = sc_matmul(a, b, granularity="per_row", mode="bipolar",
+                        sc_prec=8, stoc_len=sl, group_a=1, group_b=1,
+                        chunk_d=chunk, halve_bipolar_stoc_len=False)
+        errs.append(f"{sl}:{rel_err(out, exact):.4f}")
+    print(f"  no-halve  : " + "  ".join(errs))
+EOF
+echo "DONE $(date)"

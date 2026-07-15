@@ -1,0 +1,37 @@
+#!/bin/bash
+# CPU-only eval for one FLOP+halve adaptive-MP config (no GPU -> respects the
+# 6-GPU cap). KID + FID/IS/Precision/Recall vs the ImageNet-256 reference.
+# Usage: bash eval_mp_flop_halve_cpu.sh <AVG>
+set -uo pipefail
+AVG="${1:?usage: eval_mp_flop_halve_cpu.sh <AVG>}"
+REPO=/gpfs/accounts/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_diffusion
+PREV=/gpfs/accounts/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_diffusion_prev
+PACKER=$PREV/imagenet256_ref/parallel_npz.py
+REF=$PREV/imagenet256_ref/VIRTUAL_imagenet256_labeled.npz
+BASE=/scratch/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_diffusion_fid_mp_globalpr_flop_halve_cfg15/adaptive_avg${AVG}
+AD=$BASE/samples
+WORK=$BASE/_eval; mkdir -p "$WORK"
+OUT=$WORK/eval_avg${AVG}.txt
+export CUDA_VISIBLE_DEVICES=""   # force CPU
+source /home/zhkangqi/miniconda3/etc/profile.d/conda.sh
+exec > >(tee "$OUT") 2>&1
+echo "############ FLOP+HALVE MP EVAL avg${AVG} (CPU)  $(date) ############"
+
+IDX=$WORK/idx.txt; NPZ=$WORK/avg${AVG}.npz
+(cd "$AD" && ls [0-9][0-9][0-9][0-9][0-9][0-9].png | awk '($1+0)<2000' | sort) > "$IDX"
+SEL=$WORK/sel; rm -rf "$SEL"; mkdir -p "$SEL"
+while read -r f; do [[ -n "$f" ]] && ln -sf "$AD/$f" "$SEL/$f"; done < "$IDX"
+echo "=== matched idx 0-1999: $(wc -l < "$IDX") ==="
+
+conda activate qdit
+python -u "$PACKER" "$SEL" "$NPZ"
+conda deactivate
+
+conda activate tfeval
+export TF_CPP_MIN_LOG_LEVEL=2 EVALUATOR=$PREV/Q-DiT/models/evaluations/evaluator.py
+echo ""; echo "===== [1] KID vs ref (idx 0-1999) ====="
+bash "$REPO/scripts/eval/kid_openai.sh" "$WORK/kid_avg${AVG}.txt" "$NPZ"
+echo ""; echo "===== [2] FID / IS / sFID / Precision / Recall vs ref ====="
+python -u "$EVALUATOR" "$REF" "$NPZ" 2>&1 | grep -E "^(Inception Score|FID|sFID|Precision|Recall):" | sed "s/^/[avg${AVG}] /"
+conda deactivate
+echo ""; echo "############ DONE avg${AVG}  $(date) ############"

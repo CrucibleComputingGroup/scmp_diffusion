@@ -1,0 +1,47 @@
+#!/bin/bash
+#SBATCH --job-name=kid_ab100
+#SBATCH --partition=gpu-rtx6000
+#SBATCH --account=nbleier_owned1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-gpu=4
+#SBATCH --mem=48G
+#SBATCH --time=00:30:00
+# One-off: KID on idx 0-99 for the metric A/B probe arms + uniform48 anchor.
+# All three use the same indices (classes 0-9, 10 imgs each) vs the full
+# ImageNet-256 ref -> absolute KID inflated by class mismatch, but the
+# three-way RANKING is apples-to-apples.
+set -uo pipefail
+REPO=/gpfs/accounts/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_diffusion
+PREV=/gpfs/accounts/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_diffusion_prev
+REF=$PREV/imagenet256_ref/VIRTUAL_imagenet256_labeled.npz
+S=/scratch/nbleier_owned_root/nbleier_owned1/zhkangqi
+A=$S/scmp_diffusion_fid_mp_globalpr_flop_halve128_cfg15/adaptive_avg48/samples
+B=$S/scmp_diffusion_fid_mp_globalpr_flop_halve128_cfg15/adaptive_avg48_mse_rel/samples
+U=$S/scmp_diffusion_fid_uniform_halveON_cfg15/uniform48/samples
+F=$S/scmp_diffusion_fid_fp_6shard_cfg15/samples
+WORK=$S/scmp_diffusion_fid_mp_globalpr_flop_halve128_cfg15/_ab_eval; mkdir -p "$WORK"
+OUT=$WORK/kid_ab100.txt
+source /home/zhkangqi/miniconda3/etc/profile.d/conda.sh
+exec > >(tee "$WORK/eval_ab100.log") 2>&1
+echo "############ A/B KID idx0-99 (GPU) $(date) ############"
+
+conda activate qdit
+for arm in A B U F; do
+    src_var=$arm; src=${!src_var}
+    SEL=$WORK/sel_$arm; rm -rf "$SEL"; mkdir -p "$SEL"
+    n=0
+    for i in $(seq 0 99); do
+        f=$(printf '%06d.png' "$i")
+        [[ -f "$src/$f" ]] && ln -sf "$src/$f" "$SEL/$f" && n=$((n+1))
+    done
+    echo "[$arm] linked $n/100 from $src"
+    python -u "$REPO/scripts/eval/pngs_to_npz.py" "$SEL" "$WORK/arm_$arm.npz"
+done
+conda deactivate
+
+conda activate tfeval
+export TF_CPP_MIN_LOG_LEVEL=2 EVALUATOR=$PREV/Q-DiT/models/evaluations/evaluator.py
+python -u "$REPO/scripts/eval/kid_openai.py" "$REF" "$OUT" \
+    "$WORK/arm_A.npz" "$WORK/arm_B.npz" "$WORK/arm_U.npz" "$WORK/arm_F.npz"
+conda deactivate
+echo "############ DONE $(date) ############"

@@ -321,12 +321,12 @@ class SCAttention(nn.Module):
         if self.sc_controller.adaptive_mp_config is not None:
             assignment = adaptive_classify_rows(
                 row_metric,
-                self.sc_controller.current_timestep,
-                self.sc_controller.total_timesteps,
                 self.sc_controller.adaptive_mp_config,
                 operator=operator,
                 block_idx=self.block_idx,
                 total_blocks=self.sc_controller.total_blocks,
+                timestep=self.sc_controller.current_timestep,
+                total_timesteps=self.sc_controller.total_timesteps,
             )
         else:
             mp_config = self.sc_controller.mp_config
@@ -426,12 +426,12 @@ class SCAttention(nn.Module):
         if self.sc_controller.adaptive_mp_config is not None:
             assignment = adaptive_classify_rows(
                 row_metric,
-                self.sc_controller.current_timestep,
-                self.sc_controller.total_timesteps,
                 self.sc_controller.adaptive_mp_config,
                 operator=operator,
                 block_idx=self.block_idx,
                 total_blocks=self.sc_controller.total_blocks,
+                timestep=self.sc_controller.current_timestep,
+                total_timesteps=self.sc_controller.total_timesteps,
             )
         else:
             mp_config = self.sc_controller.mp_config
@@ -645,95 +645,85 @@ class SCAttention(nn.Module):
     # =================================================================
 
     def _sc_qk(self, q, k):
-        """SC q@k^T matmul — supports per-head mixed precision."""
+        """SC q@k^T matmul — per-query-row mixed precision.
+
+        MP granularity is per query-row (per (batch, head)), consistent with the
+        per_row quantization scale. Rows are classified by ``||Q_row||_inf``. The
+        old per-head stoc_len path was removed so MP and quant granularity match.
+        """
         q_scaled = q * self.scale
         B, H, N, D = q_scaled.shape
 
-        head_stoc_lens = self.sc_controller.get_group_stoc_lens(
-            self.block_idx, "qk")
+        has_dynamic_mp = (self.sc_controller.adaptive_mp_config is not None
+                          or self.sc_controller.mp_config is not None)
 
-        # Dynamic MP: compute per-head stoc_lens from Q magnitude
-        if head_stoc_lens is None and (self.sc_controller.adaptive_mp_config is not None
-                                        or self.sc_controller.mp_config is not None):
-            q_metric = q_scaled.float().abs().amax(dim=(0, 2, 3))  # [H]
-            MetricProfiler.record(q_metric, self.sc_controller.current_timestep,
-                                  self.block_idx, "qk")
-
-            if self.sc_controller.adaptive_mp_config is not None:
-                assignment = adaptive_classify_rows(
-                    q_metric,
-                    self.sc_controller.current_timestep,
-                    self.sc_controller.total_timesteps,
-                    self.sc_controller.adaptive_mp_config,
-                    operator="qk",
-                    block_idx=self.block_idx,
-                    total_blocks=self.sc_controller.total_blocks,
-                )
-            else:
-                mp_config = self.sc_controller.mp_config
-                assignment = classify_rows_by_metric(
-                    q_metric, mp_config.stoc_len_levels, mp_config.level_fractions)
-
-            MPDistributionLogger.log(
-                self.sc_controller.current_timestep, self.block_idx,
-                "qk", assignment, H)
-
-            head_stoc_lens = [0] * H
-            for sl, heads in assignment.level_row_indices.items():
-                for h_idx in heads:
-                    head_stoc_lens[h_idx.item()] = sl
-
-        if head_stoc_lens is None:
-            # Uniform precision — existing fast path
+        if not has_dynamic_mp:
+            # Uniform precision — existing fast path (batched kernel).
             stoc_len = self.sc_controller.get_stoc_len(self.block_idx, "qk")
             sc_prec = self.sc_controller.resolve_sc_prec(stoc_len)
             return self._sc_qk_uniform(q_scaled, k, sc_prec, stoc_len)
 
-        # Mixed: group heads by stoc_len, compute within each group
-        output = torch.zeros(B, H, N, N, device=q.device, dtype=torch.float32)
-        stoc_len_to_heads: dict[int, list[int]] = defaultdict(list)
-        for h, sl in enumerate(head_stoc_lens):
-            stoc_len_to_heads[sl].append(h)
+        # Dynamic per-query-row MP (adaptive or fixed): one stoc_len per query
+        # row within each (batch, head). Mirrors _sc_av's per-row path and keeps
+        # MP granularity aligned with the per_row quant scale.
+        BH = B * H
+        q_flat = q_scaled.reshape(BH, N, D).float()
+        k_flat = k.reshape(BH, N, D).float()
+        output = torch.zeros(BH, N, N, device=q.device, dtype=torch.float32)
 
+        matmul_fn = self._get_matmul_fn()
         baseline_stoc_len = self.sc_controller.stoc_len
-        compute_baseline = B * H * N * N * D * baseline_stoc_len
+        compute_baseline = 0
         compute_actual = 0.0
 
-        for sl, heads in stoc_len_to_heads.items():
-            # Pruned heads (stoc_len=0): output already zeroed
-            if sl == 0:
-                continue
-            compute_actual += B * len(heads) * N * N * D * sl
+        for i in range(BH):
+            row_metric = q_flat[i].abs().amax(dim=-1)  # [N] = ||Q_row||_inf
+            if i == 0:  # profile / log once per (t, block)
+                MetricProfiler.record(row_metric, self.sc_controller.current_timestep,
+                                      self.block_idx, "qk")
 
-            sp = self.sc_controller.resolve_sc_prec(sl)
-            config = self._get_sc_config(D, sp)
+            if self.sc_controller.adaptive_mp_config is not None:
+                assignment = adaptive_classify_rows(
+                    row_metric,
+                    self.sc_controller.adaptive_mp_config,
+                    operator="qk",
+                    block_idx=self.block_idx,
+                    total_blocks=self.sc_controller.total_blocks,
+                    timestep=self.sc_controller.current_timestep,
+                    total_timesteps=self.sc_controller.total_timesteps,
+                )
+            else:
+                mp_config = self.sc_controller.mp_config
+                assignment = classify_rows_by_metric(
+                    row_metric, mp_config.stoc_len_levels, mp_config.level_fractions)
 
-            for h in heads:
-                # Extract single head: [B, 1, N, D] -> [B, N, D]
-                q_h = q_scaled[:, h].float()
-                k_h = k[:, h].float()
+            if i == 0:
+                MPDistributionLogger.log(
+                    self.sc_controller.current_timestep, self.block_idx,
+                    "qk", assignment, N)
 
-                matmul_fn = self._get_matmul_fn()
-                if self.sc_mode == "bipolar":
-                    output[:, h] = matmul_fn(
-                        q_h, k_h, granularity="per_head", mode="bipolar",
-                        sc_prec=sp, config=config, stoc_len=sl,
-                        rng_levels=self._rng_levels(sl),
-                    )
-                else:
-                    for b_idx in range(B):
-                        output[b_idx, h] = matmul_fn(
-                            q_h[b_idx], k_h[b_idx],
-                            granularity="per_tensor", mode=self.sc_mode,
-                            sc_prec=sp, config=config, stoc_len=sl,
-                            rng_levels=self._rng_levels(sl),
-                        )
+            k_i = k_flat[i]  # [N, D]
+            for sl, rows in assignment.level_row_indices.items():
+                if len(rows) == 0 or sl == 0:
+                    continue  # pruned rows: output already zeroed
+                n_rows = len(rows)
+                compute_baseline += n_rows * N * D * baseline_stoc_len
+                compute_actual += n_rows * N * D * sl
+
+                sp = self.sc_controller.resolve_sc_prec(sl)
+                config = self._get_sc_config(D, sp)
+                q_sub = q_flat[i][rows]  # [n_rows, D]
+                output[i, rows] = matmul_fn(
+                    q_sub, k_i,
+                    granularity="per_row", group_a=1, group_b=1,
+                    mode=self.sc_mode, sc_prec=sp, config=config,
+                    stoc_len=sl, rng_levels=self._rng_levels(sl))
 
         MPDistributionLogger.log_compute(
             self.sc_controller.current_timestep, self.block_idx,
             "qk", compute_baseline, compute_actual)
 
-        return output
+        return output.reshape(B, H, N, N)
 
     def _sc_qk_uniform(self, q_scaled, k, sc_prec, stoc_len):
         """Uniform precision QK — fully batched kernel or per-head loop."""
@@ -852,12 +842,12 @@ class SCAttention(nn.Module):
                 if self.sc_controller.adaptive_mp_config is not None:
                     assignment = adaptive_classify_rows(
                         row_max,
-                        self.sc_controller.current_timestep,
-                        self.sc_controller.total_timesteps,
                         self.sc_controller.adaptive_mp_config,
                         operator="av",
                         block_idx=self.block_idx,
                         total_blocks=self.sc_controller.total_blocks,
+                        timestep=self.sc_controller.current_timestep,
+                        total_timesteps=self.sc_controller.total_timesteps,
                     )
                 else:
                     mp_config = self.sc_controller.mp_config

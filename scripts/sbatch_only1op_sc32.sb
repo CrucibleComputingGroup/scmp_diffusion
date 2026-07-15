@@ -1,0 +1,58 @@
+#!/bin/bash
+#SBATCH --job-name=only1op32
+#SBATCH --partition=gpu-rtx6000
+#SBATCH --account=nbleier_owned1
+#SBATCH --gres=gpu:3
+#SBATCH --cpus-per-gpu=2
+#SBATCH --mem-per-gpu=12G
+#SBATCH --time=06:00:00
+# Single-op SC isolation probe (era-2 code): EVERYTHING runs FP except the ONE
+# selected op-group, which runs SC at uniform stoc_len=32 + halve. Generates
+# idx 0-99. The bifurcation rate vs FP directly measures that op's solo
+# trajectory-branching power at a stressed length.
+# v2: isolation via per-op config JSON (enabled=false for others) — the
+# layerwise flags are IGNORED when --sc_config provides a precision map
+# (sc_controller.py:115), which silently turned v1 into uniform32 x5.
+# Usage: sbatch sbatch_only1op_sc32.sb <OP>   OP in: qk av proj inproj mlp
+set -uo pipefail
+OP="${1:?usage: sbatch sbatch_only1op_sc32.sb <qk|av|proj|inproj|mlp>}"
+QK=0; AV=0; PROJ=0; INPROJ=0; MLP=0
+case "$OP" in
+  qk) QK=1.0 ;;
+  av) AV=1.0 ;;
+  proj) PROJ=1.0 ;;
+  inproj) INPROJ=1.0 ;;
+  mlp) MLP=1.0 ;;
+  *) echo "unknown OP $OP" >&2; exit 1 ;;
+esac
+NUM_GPUS=3
+REPO=/gpfs/accounts/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_diffusion
+SCRATCH=/scratch/nbleier_owned_root/nbleier_owned1/zhkangqi
+CKPT=$SCRATCH/pretrained_models/DiT-XL-2-256x256.pt
+SC_JSON=$SCRATCH/scmp_diffusion_fid_halve_bitrev/configs/sc_cfg_only32_${OP}.json
+OUT=$SCRATCH/scmp_diffusion_fid_uniform_halveON_cfg15/only1op32b_${OP}
+SAMPLES=$OUT/samples; IDX=$OUT/_indices; LOG=$OUT/_logs
+NUM_FID=100; BALANCED=10000; BATCH=64; STEPS=50; CFG=1.5; SEED=0; NUM_CLASSES=1000
+mkdir -p "$SAMPLES" "$IDX" "$LOG"
+source /home/zhkangqi/miniconda3/etc/profile.d/conda.sh; conda activate qdit
+export SC_OWEN_MODE=bitrev PYTHONUNBUFFERED=1 OMP_NUM_THREADS=2; cd "$REPO"
+echo "=== only1op SC32 op=$OP (qk=$QK av=$AV proj=$PROJ inproj=$INPROJ mlp=$MLP) job=${SLURM_JOB_ID:-?} $(date) ==="
+python -u scripts/_plan_missing_indices.py "$SAMPLES" "$NUM_FID" "$NUM_GPUS" "$IDX" $((BALANCED/NUM_CLASSES))
+pids=()
+for ((g=0; g<NUM_GPUS; g++)); do
+    IDXF="$IDX/gpu_${g}.txt"; [[ -s "$IDXF" ]] || { echo "[gpu$g] no work"; continue; }
+    CUDA_VISIBLE_DEVICES=$g python -u scripts/quant_sc_main.py \
+        --wbits 8 --abits 8 --w_sym --a_sym \
+        --timewise 1 --qklayerwise "$QK" --avlayerwise "$AV" --projlayerwise "$PROJ" --mlplayerwise "$MLP" --inputprojlayerwise "$INPROJ" \
+        --sc_prec 8 --sc_fixed_level_prec --sc_qk_granularity per_row \
+        --sc_config "$SC_JSON" --sc_halve \
+        --image-size 256 --num-sampling-steps "$STEPS" --cfg-scale "$CFG" --batch-size "$BATCH" \
+        --generate-fid-samples --balanced_classes --num-classes "$NUM_CLASSES" \
+        --balanced_total_samples "$BALANCED" --num-fid-samples "$BALANCED" \
+        --target_indices_path "$IDXF" --samples_dir_override "$SAMPLES" \
+        --seed "$SEED" --results-dir "$LOG/gpu_${g}" --ckpt "$CKPT" \
+        > "$LOG/gpu_${g}.log" 2>&1 &
+    pids+=($!)
+done
+for p in "${pids[@]}"; do wait "$p" || true; done
+echo "=== only1op $OP done: $(find "$SAMPLES" -name '*.png' | wc -l)/$NUM_FID $(date) ==="
