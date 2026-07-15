@@ -1,0 +1,45 @@
+#!/bin/bash
+#SBATCH --job-name=uni48_rerun
+#SBATCH --partition=gpu-rtx6000
+#SBATCH --account=nbleier_owned1
+#SBATCH --gres=gpu:3
+#SBATCH --cpus-per-gpu=2
+#SBATCH --mem-per-gpu=12G
+#SBATCH --time=06:00:00
+# One-off reproducibility probe: regenerate uniform48 (halve) idx 0-99 under
+# the CURRENT code state into a fresh dir, to verify the uniform48 anchor
+# still reproduces (~24 dB vs FP, ~5% bifurcation) after the kernel guard /
+# recent changes. Identical flags/config/seed to sbatch_uniform_halve_auto.sb.
+set -uo pipefail
+NUM_GPUS=3
+REPO=/gpfs/accounts/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_diffusion
+SCRATCH=/scratch/nbleier_owned_root/nbleier_owned1/zhkangqi
+CKPT=$SCRATCH/pretrained_models/DiT-XL-2-256x256.pt
+SC_JSON=$SCRATCH/scmp_diffusion_fid_halve_bitrev/configs/sc_cfg_uniform48_all.json
+OUT=$SCRATCH/scmp_diffusion_fid_uniform_halveON_cfg15/uniform48_rerun
+SAMPLES=$OUT/samples; IDX=$OUT/_indices; LOG=$OUT/_logs
+NUM_FID=100; BALANCED=10000; BATCH=64; STEPS=50; CFG=1.5; SEED=0; NUM_CLASSES=1000
+mkdir -p "$SAMPLES" "$IDX" "$LOG"
+[[ -f "$SC_JSON" ]] || { echo "ERROR: missing $SC_JSON" >&2; exit 1; }
+source /home/zhkangqi/miniconda3/etc/profile.d/conda.sh; conda activate qdit
+export SC_OWEN_MODE=bitrev PYTHONUNBUFFERED=1 OMP_NUM_THREADS=2; cd "$REPO"
+echo "=== uniform48 RERUN probe: target=$NUM_FID job=${SLURM_JOB_ID:-?} $(date) ==="
+python -u scripts/_plan_missing_indices.py "$SAMPLES" "$NUM_FID" "$NUM_GPUS" "$IDX" $((BALANCED/NUM_CLASSES))
+pids=()
+for ((g=0; g<NUM_GPUS; g++)); do
+    IDXF="$IDX/gpu_${g}.txt"; [[ -s "$IDXF" ]] || { echo "[gpu$g] no work"; continue; }
+    CUDA_VISIBLE_DEVICES=$g python -u scripts/quant_sc_main.py \
+        --wbits 8 --abits 8 --w_sym --a_sym \
+        --timewise 1 --qklayerwise 1.0 --avlayerwise 1.0 --projlayerwise 1.0 --mlplayerwise 1.0 --inputprojlayerwise 1.0 \
+        --sc_prec 8 --sc_fixed_level_prec --sc_qk_granularity per_row \
+        --sc_config "$SC_JSON" --sc_halve \
+        --image-size 256 --num-sampling-steps "$STEPS" --cfg-scale "$CFG" --batch-size "$BATCH" \
+        --generate-fid-samples --balanced_classes --num-classes "$NUM_CLASSES" \
+        --balanced_total_samples "$BALANCED" --num-fid-samples "$BALANCED" \
+        --target_indices_path "$IDXF" --samples_dir_override "$SAMPLES" \
+        --seed "$SEED" --results-dir "$LOG/gpu_${g}" --ckpt "$CKPT" \
+        > "$LOG/gpu_${g}.log" 2>&1 &
+    pids+=($!)
+done
+for p in "${pids[@]}"; do wait "$p" || true; done
+echo "=== uniform48 RERUN done: $(find "$SAMPLES" -name '*.png' | wc -l)/$NUM_FID $(date) ==="
