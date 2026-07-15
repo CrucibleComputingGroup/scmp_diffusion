@@ -141,6 +141,22 @@ def _cosine_dist_heads(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor
     return 1.0 - cos
 
 
+def _relative_mse_rows(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Squared relative L2 per row: ||d||^2 / ||t||^2.
+
+    Small-error expansion = gain_err^2 + orthogonal_r^2: keeps cosine's
+    quadratic (second-order-loss) curvature and relative row weighting, but
+    also sees pure gain/bias errors that cosine is blind to.
+    """
+    r = _relative_l2_rows(pred, target)
+    return r * r
+
+
+def _relative_mse_heads(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    r = _relative_l2_heads(pred, target)
+    return r * r
+
+
 # Globals dispatched from CLI flags --metric / --teacher.
 _METRIC_ROWS = _relative_l2_rows
 _METRIC_HEADS = _relative_l2_heads
@@ -1098,9 +1114,10 @@ def _build_parser():
     parser.add_argument(
         "--metric",
         type=str,
-        choices=["l2", "cosine"],
+        choices=["l2", "cosine", "mse_rel"],
         default="cosine",
-        help="Per-unit error metric. cosine = 1 - cos_sim (recommended for fix mode).",
+        help="Per-unit error metric. cosine = 1 - cos_sim (recommended for fix mode); "
+             "mse_rel = ||d||^2/||t||^2 (cosine's curvature + gain-error sensitivity).",
     )
     parser.add_argument(
         "--teacher",
@@ -1126,6 +1143,23 @@ def main():
     operators = _parse_csv_set(args.operators)
     explicit_timesteps = _parse_csv_ints(args.calib_timesteps)
     budget_ref_stoc_len = args.budget_ref_stoc_len or max(levels)
+
+    # Halve mode: the sign-magnitude grid (and hence the longest realizable
+    # stream) is 2^(sc_prec-1). Levels above that would probe accuracy the
+    # halve hardware cannot deliver, and a larger budget_ref silently rescales
+    # every budget_ratio, so reject both loudly.
+    if args.sc_halve:
+        halve_max = 2 ** (args.sc_prec - 1)
+        bad = [lv for lv in levels if lv > halve_max]
+        if bad:
+            raise ValueError(
+                f"--sc_halve: mp_levels {bad} exceed the halve-mode maximum "
+                f"2^(sc_prec-1)={halve_max}; use levels <= {halve_max}.")
+        if budget_ref_stoc_len > halve_max:
+            raise ValueError(
+                f"--sc_halve: budget_ref_stoc_len={budget_ref_stoc_len} exceeds "
+                f"the halve-mode maximum {halve_max}. Express budget_ratio "
+                f"against {halve_max} (avg = budget_ratio * {halve_max}).")
 
     latent_size = args.image_size // 8
     model = DiT_models[args.model](
@@ -1168,6 +1202,9 @@ def main():
     if args.metric == "cosine":
         _METRIC_ROWS = _cosine_dist_rows
         _METRIC_HEADS = _cosine_dist_heads
+    elif args.metric == "mse_rel":
+        _METRIC_ROWS = _relative_mse_rows
+        _METRIC_HEADS = _relative_mse_heads
     _USE_FP_TEACHER = (args.teacher == "fp")
     _SC_HALVE = bool(args.sc_halve)
     print(f"SC halve during calibration: {_SC_HALVE}")
