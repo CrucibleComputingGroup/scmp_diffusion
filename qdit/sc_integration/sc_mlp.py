@@ -25,6 +25,7 @@ from ..quant import Quantizer
 from ..qLinearLayer import QLinearLayer
 from .sc_controller import SCController
 from .mp_config import classify_rows_by_metric, adaptive_classify_rows, MPDistributionLogger, MetricProfiler
+from .sc_kbands import resolve_k_bands, band_columns, _reject_k_bands_on_combined_mp
 
 from scmp_kernels.sc import sc_matmul
 from scmp_kernels.sc.config_helpers import make_sobol_simple_config
@@ -234,35 +235,88 @@ class SCMlp(nn.Module):
         compute_baseline = 0
         compute_actual = 0.0
 
-        for sl, rows in assignment.level_row_indices.items():
-            if len(rows) == 0 or sl == 0:
-                continue  # pruned rows: result already zeroed
-            n_rows = len(rows)
-            compute_baseline += n_rows * out_features * D * baseline_stoc_len
-            compute_actual += n_rows * out_features * D * sl
+        k_bands = resolve_k_bands(
+            self.sc_controller, operator, self.block_idx, D, chunk_d)
 
-            sp = self.sc_controller.resolve_sc_prec(sl)
-            x_sub = x_flat[rows].contiguous()  # [len(rows), D]
+        if k_bands is not None:
+            # ---- per-group (K-band) stream lengths -----------------------
+            # Same rung index per row as the per-row parent; band b runs that
+            # rung at its own length.  Bands partition the contraction axis
+            # into whole quantization chunks, so each chunk keeps the exact
+            # scale and RNG table it would have had in the unbanded call, and
+            # the bands' partial products sum to the same matmul.
+            band_of_chunk, band_ladders = k_bands
+            n_bands = len(band_ladders)
+            n_rungs = len(band_ladders[0])
+            parent_levels = self.sc_controller.adaptive_mp_config.stoc_len_levels
+            cols_per_band, width_per_band = band_columns(
+                self, band_of_chunk, n_bands, chunk_d, D, x_flat.device)
 
-            if chunk_d > 0 and D > chunk_d:
-                config = self._get_sc_config(chunk_d, sp)
-                sub = matmul_fn(
-                    x_sub, weight,
-                    granularity="per_row",
-                    mode=self.sc_mode, sc_prec=sp, config=config,
-                    group_a=1, group_b=1, chunk_d=chunk_d,
-                    stoc_len=sl,
-                    rng_levels=self._rng_levels(sl))
-            else:
-                config = self._get_sc_config(D, sp)
-                sub = matmul_fn(
-                    x_sub, weight,
-                    granularity="per_row",
-                    mode=self.sc_mode, sc_prec=sp, config=config,
-                    group_a=1, group_b=1,
-                    stoc_len=sl,
-                    rng_levels=self._rng_levels(sl))
-            result[rows] = sub
+            rows_by_rung = [
+                (assignment.row_levels == k).nonzero(as_tuple=True)[0]
+                for k in range(n_rungs)
+            ]
+            for k, rows in enumerate(rows_by_rung):
+                if rows.numel() == 0 or parent_levels[k] == 0:
+                    continue
+                compute_baseline += (
+                    rows.numel() * out_features * D * baseline_stoc_len)
+
+            for b in range(n_bands):
+                cols = cols_per_band[b]
+                if cols.numel() == 0:
+                    continue
+                x_band = x_flat.index_select(1, cols).contiguous()
+                w_band = weight.index_select(1, cols).contiguous()
+                band_width = width_per_band[b]
+                for k, rows in enumerate(rows_by_rung):
+                    sl = int(band_ladders[b][k])
+                    if sl <= 0 or rows.numel() == 0:
+                        continue  # this band contributes nothing for these rows
+                    compute_actual += (
+                        rows.numel() * out_features * band_width * sl)
+                    sp = self.sc_controller.resolve_sc_prec(sl)
+                    # Same config as the unbanded call: a band is >= 2 chunks
+                    # wide, so the kernel re-chunks it at the same boundaries.
+                    config = self._get_sc_config(chunk_d, sp)
+                    # bands accumulate into the shared row buffer
+                    result[rows] += matmul_fn(
+                        x_band.index_select(0, rows).contiguous(), w_band,
+                        granularity="per_row",
+                        mode=self.sc_mode, sc_prec=sp, config=config,
+                        group_a=1, group_b=1, chunk_d=chunk_d,
+                        stoc_len=sl,
+                        rng_levels=self._rng_levels(sl))
+        else:
+            for sl, rows in assignment.level_row_indices.items():
+                if len(rows) == 0 or sl == 0:
+                    continue  # pruned rows: result already zeroed
+                n_rows = len(rows)
+                compute_baseline += n_rows * out_features * D * baseline_stoc_len
+                compute_actual += n_rows * out_features * D * sl
+
+                sp = self.sc_controller.resolve_sc_prec(sl)
+                x_sub = x_flat[rows].contiguous()  # [len(rows), D]
+
+                if chunk_d > 0 and D > chunk_d:
+                    config = self._get_sc_config(chunk_d, sp)
+                    sub = matmul_fn(
+                        x_sub, weight,
+                        granularity="per_row",
+                        mode=self.sc_mode, sc_prec=sp, config=config,
+                        group_a=1, group_b=1, chunk_d=chunk_d,
+                        stoc_len=sl,
+                        rng_levels=self._rng_levels(sl))
+                else:
+                    config = self._get_sc_config(D, sp)
+                    sub = matmul_fn(
+                        x_sub, weight,
+                        granularity="per_row",
+                        mode=self.sc_mode, sc_prec=sp, config=config,
+                        group_a=1, group_b=1,
+                        stoc_len=sl,
+                        rng_levels=self._rng_levels(sl))
+                result[rows] = sub
 
         MPDistributionLogger.log_compute(
             self.sc_controller.current_timestep, self.block_idx,
@@ -284,6 +338,8 @@ class SCMlp(nn.Module):
         """
         orig_shape = x.shape
         D = x.shape[-1]
+        _reject_k_bands_on_combined_mp(
+            self.sc_controller, operator, self.block_idx, D, chunk_d)
         x_flat = x.reshape(-1, D)
         M = x_flat.shape[0]
 

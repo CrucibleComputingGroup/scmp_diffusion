@@ -273,7 +273,51 @@ class SCController:
 
         When set, this takes priority over mp_config for dynamic MP paths.
         """
+        if getattr(adaptive_mp_config, "k_band_count", 0):
+            self._validate_k_bands(adaptive_mp_config)
         self.adaptive_mp_config = adaptive_mp_config
+
+    # Operators whose contraction axis is an input-channel dim wide enough to
+    # partition into quantization chunks. qk/av contract over head_dim, which
+    # is smaller than one chunk, so they have no band dispatch at all -- a
+    # table naming them would be silently ignored, which is why this raises.
+    K_BAND_OPERATORS = ("mlp_fc1", "mlp_fc2", "proj", "input_proj")
+
+    def _validate_k_bands(self, adaptive_mp_config) -> None:
+        """Reject band allocations this controller cannot actually execute.
+
+        Both failures below would otherwise surface only as a wrong number:
+        an unsupported operator runs the per-row parent while the run is
+        labelled k-bands, and an over-long band length is a stream the halve
+        hardware cannot realize.
+        """
+        named = {op for op, _ in adaptive_mp_config.k_band_chunks}
+        unsupported = sorted(named - set(self.K_BAND_OPERATORS))
+        if unsupported:
+            raise ValueError(
+                f"K-band table names operators with no band dispatch: "
+                f"{unsupported}. Only {list(self.K_BAND_OPERATORS)} contract "
+                f"over an input-channel axis; qk/av contract over head_dim and "
+                f"would run the per-row parent while the run is labelled "
+                f"k-bands.")
+
+        # Bands raise the length of the rungs they favour, so a band ladder can
+        # exceed the halve-mode ceiling even when the parent ladder does not.
+        # sc_matmul enforces this per call for bipolar; checking it here turns
+        # a mid-run crash on some later timestep into a startup error.
+        if not self.halve:
+            return
+        max_len = 2 ** (self.sc_prec - 1)
+        for key, band_ladders in adaptive_mp_config.k_band_ladders.items():
+            for b, rungs in enumerate(band_ladders):
+                for k, sl in enumerate(rungs):
+                    if sl > max_len:
+                        raise ValueError(
+                            f"K-band ladder {key} band {b} rung {k} is "
+                            f"stoc_len={sl}, above the halve-mode maximum "
+                            f"{max_len} for sc_prec={self.sc_prec}. Such a "
+                            f"stream is unrealizable on halve hardware and "
+                            f"would silently inflate simulated accuracy.")
 
     def init_range_mp(self, range_mp_config: RangeMPConfig):
         """Initialize range-based mixed precision (weight min/max range).

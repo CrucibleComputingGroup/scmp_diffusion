@@ -25,6 +25,7 @@ from ..quant import Quantizer
 from ..qLinearLayer import QLinearLayer
 from .sc_controller import SCController
 from .mp_config import classify_rows_by_metric, adaptive_classify_rows, MPDistributionLogger, MetricProfiler
+from .sc_kbands import resolve_k_bands, band_of_chunk_index, _reject_k_bands_on_combined_mp
 
 from scmp_kernels.sc import sc_matmul
 from scmp_kernels.sc.config_helpers import make_sobol_simple_config
@@ -348,48 +349,96 @@ class SCAttention(nn.Module):
         compute_baseline = 0
         compute_actual = 0.0
 
-        for sl, rows in assignment.level_row_indices.items():
-            if len(rows) == 0 or sl == 0:
-                continue
-            n_rows = len(rows)
-            compute_baseline += n_rows * out_features * D * baseline_stoc_len
-            compute_actual += n_rows * out_features * D * sl
+        k_bands = resolve_k_bands(
+            self.sc_controller, operator, self.block_idx, D, chunk_d)
 
-            sp = self.sc_controller.resolve_sc_prec(sl)
-            x_sub = x_flat[rows].contiguous()
-
+        if k_bands is not None:
+            # ---- per-group (K-band) stream lengths -----------------------
+            # The app-level chunk loop already walks the contraction axis one
+            # quantization chunk at a time; a band is just a label on those
+            # chunks, so the only change is which stoc_len each chunk runs at.
+            # Rows are grouped by RUNG index (not by parent stoc_len value),
+            # because the rung is what indexes every band's ladder.
+            band_of_chunk, band_ladders = k_bands
+            n_rungs = len(band_ladders[0])
+            parent_levels = self.sc_controller.adaptive_mp_config.stoc_len_levels
             granularity = "per_row" if grouped else "per_tensor"
-            if chunk_d > 0 and D > chunk_d:
-                sub_result = None
-                for start in range(0, D, chunk_d):
-                    end = min(start + chunk_d, D)
-                    x_chunk = x_sub[:, start:end].contiguous()
-                    w_chunk = weight[:, start:end].contiguous()
-                    config = self._get_sc_config(end - start, sp)
 
+            for k in range(n_rungs):
+                rows = (assignment.row_levels == k).nonzero(as_tuple=True)[0]
+                if rows.numel() == 0 or parent_levels[k] == 0:
+                    continue
+                n_rows = rows.numel()
+                compute_baseline += n_rows * out_features * D * baseline_stoc_len
+
+                x_sub = x_flat[rows].contiguous()
+                sub_result = None
+                for chunk_idx, start in enumerate(range(0, D, chunk_d)):
+                    end = min(start + chunk_d, D)
+                    band = band_of_chunk_index(band_of_chunk, chunk_idx)
+                    sl = int(band_ladders[band][k])
+                    if sl <= 0:
+                        continue  # this band contributes nothing at this rung
+                    compute_actual += n_rows * out_features * (end - start) * sl
+
+                    sp = self.sc_controller.resolve_sc_prec(sl)
+                    config = self._get_sc_config(end - start, sp)
                     kwargs = dict(granularity=granularity,
                                   mode=self.sc_mode, sc_prec=sp, config=config,
                                   stoc_len=sl, rng_levels=self._rng_levels(sl))
                     if grouped:
                         kwargs.update(group_a=1, group_b=1)
 
-                    chunk_out = matmul_fn(x_chunk, w_chunk, **kwargs)
+                    chunk_out = matmul_fn(x_sub[:, start:end].contiguous(),
+                                          weight[:, start:end].contiguous(),
+                                          **kwargs)
+                    sub_result = (chunk_out if sub_result is None
+                                  else sub_result + chunk_out)
+                if sub_result is not None:
+                    result[rows] = sub_result
+        else:
+            for sl, rows in assignment.level_row_indices.items():
+                if len(rows) == 0 or sl == 0:
+                    continue
+                n_rows = len(rows)
+                compute_baseline += n_rows * out_features * D * baseline_stoc_len
+                compute_actual += n_rows * out_features * D * sl
 
-                    if sub_result is None:
-                        sub_result = chunk_out
-                    else:
-                        sub_result = sub_result + chunk_out
-                result[rows] = sub_result
-            else:
-                config = self._get_sc_config(D, sp)
-                kwargs = dict(granularity=granularity,
-                              mode=self.sc_mode, sc_prec=sp, config=config,
-                              stoc_len=sl, rng_levels=self._rng_levels(sl))
-                if grouped:
-                    kwargs.update(group_a=1, group_b=1)
+                sp = self.sc_controller.resolve_sc_prec(sl)
+                x_sub = x_flat[rows].contiguous()
 
-                sub = matmul_fn(x_sub, weight, **kwargs)
-                result[rows] = sub
+                granularity = "per_row" if grouped else "per_tensor"
+                if chunk_d > 0 and D > chunk_d:
+                    sub_result = None
+                    for start in range(0, D, chunk_d):
+                        end = min(start + chunk_d, D)
+                        x_chunk = x_sub[:, start:end].contiguous()
+                        w_chunk = weight[:, start:end].contiguous()
+                        config = self._get_sc_config(end - start, sp)
+
+                        kwargs = dict(granularity=granularity,
+                                      mode=self.sc_mode, sc_prec=sp, config=config,
+                                      stoc_len=sl, rng_levels=self._rng_levels(sl))
+                        if grouped:
+                            kwargs.update(group_a=1, group_b=1)
+
+                        chunk_out = matmul_fn(x_chunk, w_chunk, **kwargs)
+
+                        if sub_result is None:
+                            sub_result = chunk_out
+                        else:
+                            sub_result = sub_result + chunk_out
+                    result[rows] = sub_result
+                else:
+                    config = self._get_sc_config(D, sp)
+                    kwargs = dict(granularity=granularity,
+                                  mode=self.sc_mode, sc_prec=sp, config=config,
+                                  stoc_len=sl, rng_levels=self._rng_levels(sl))
+                    if grouped:
+                        kwargs.update(group_a=1, group_b=1)
+
+                    sub = matmul_fn(x_sub, weight, **kwargs)
+                    result[rows] = sub
 
         MPDistributionLogger.log_compute(
             self.sc_controller.current_timestep, self.block_idx,
@@ -415,6 +464,8 @@ class SCAttention(nn.Module):
         """
         orig_shape = x.shape
         D = x.shape[-1]
+        _reject_k_bands_on_combined_mp(
+            self.sc_controller, operator, self.block_idx, D, chunk_d)
         x_flat = x.reshape(-1, D)
         M = x_flat.shape[0]
 
