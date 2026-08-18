@@ -1,0 +1,62 @@
+#!/bin/bash
+#SBATCH --job-name=mp_dist_probe
+#SBATCH --partition=gpu-rtx6000
+#SBATCH --account=nbleier_owned1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-gpu=4
+#SBATCH --mem=48G
+#SBATCH --time=01:00:00
+# A4 instrumented probe: run the VALIDATE path (8 imgs, dumps
+# debug_mp_distribution.csv) once with the OLD 256-grid flop-halve table and
+# once with the NEW 128-cap table, then print realized per-op level fractions
+# side by side. 10 sampling steps -> one visit per t-bucket, enough for the
+# realized-distribution comparison at ~7 min/run.
+set -uo pipefail
+REPO=/gpfs/accounts/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_diffusion
+S=/scratch/nbleier_owned_root/nbleier_owned1/zhkangqi
+CKPT=$S/pretrained_models/DiT-XL-2-256x256.pt
+OLD_CALIB=$S/scmp_diffusion_fid_mp_cfg15/calib_global_perrow_flop_halve/calib_fix_avg48.json
+NEW_CALIB=$S/scmp_diffusion_fid_mp_cfg15/calib_global_perrow_flop_halve_max128/calib_fix_avg48.json
+WORK=$S/scmp_diffusion_fid_mp_globalpr_flop_halve128_cfg15/_dist_probe
+mkdir -p "$WORK"
+source /home/zhkangqi/miniconda3/etc/profile.d/conda.sh; conda activate qdit
+export SC_OWEN_MODE=bitrev PYTHONUNBUFFERED=1 OMP_NUM_THREADS=2; cd "$REPO"
+exec > >(tee "$WORK/probe.log") 2>&1
+
+run_probe () {
+    local tag="$1" calib="$2" levels="$3"
+    echo "===== probe $tag levels=$levels ====="
+    rm -rf "$WORK/$tag"; mkdir -p "$WORK/$tag"
+    python -u scripts/quant_sc_main.py \
+        --wbits 8 --abits 8 --w_sym --a_sym \
+        --timewise 1 --qklayerwise 1.0 --avlayerwise 1.0 --projlayerwise 1.0 --mlplayerwise 1.0 --inputprojlayerwise 1.0 \
+        --sc_prec 8 --sc_fixed_level_prec --sc_qk_granularity per_row --sc_halve \
+        --adaptive_mp --adaptive_mp_table "$calib" --mp_levels "$levels" \
+        --image-size 256 --num-sampling-steps 10 --cfg-scale 1.5 \
+        --seed 0 --results-dir "$WORK/$tag" --ckpt "$CKPT"
+    find "$WORK/$tag" -name 'debug_mp_distribution.csv' -exec cp {} "$WORK/dist_$tag.csv" \;
+    find "$WORK/$tag" -name 'mp_savings_summary.txt' -exec cp {} "$WORK/savings_$tag.txt" \;
+}
+
+run_probe old "$OLD_CALIB" "256,192,128,96,64,48,32,16"
+run_probe new "$NEW_CALIB" "128,96,64,48,32,16"
+
+python - << 'EOF'
+import csv, collections
+for tag in ("old", "new"):
+    per_op = collections.defaultdict(lambda: collections.Counter())
+    tot = collections.Counter()
+    with open(f"/scratch/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_diffusion_fid_mp_globalpr_flop_halve128_cfg15/_dist_probe/dist_{tag}.csv") as f:
+        for row in csv.DictReader(f):
+            op = row["operator"]
+            for k, v in row.items():
+                if k.startswith("sl_") and k.endswith("_count") and v:
+                    sl = int(k.split("_")[1]); per_op[op][sl] += int(v); tot[op] += int(v)
+    print(f"===== REALIZED distribution ({tag} table) =====")
+    for op in sorted(per_op):
+        c = per_op[op]; n = tot[op]
+        avg = sum(sl * cnt for sl, cnt in c.items()) / max(n, 1)
+        fr = "  ".join(f"{sl}:{100*cnt/n:.1f}%" for sl, cnt in sorted(c.items(), reverse=True) if cnt)
+        print(f"  {op:12s} avg={avg:7.1f}  {fr}")
+EOF
+echo "DONE $(date)"

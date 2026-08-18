@@ -16,3 +16,7 @@ logs_mp_sweep/
 evaluation/sample_grids/
 evaluation/imagenet_ref/images/
 evaluation/imagenet_ref/*.npz
+
+# SLURM job logs and generated figures (run artifacts — regenerated, not source)
+slurm-*.out
+figures/

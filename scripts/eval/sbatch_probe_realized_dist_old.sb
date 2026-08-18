@@ -1,0 +1,51 @@
+#!/bin/bash
+#SBATCH --job-name=mp_dist_old
+#SBATCH --partition=gpu-rtx6000
+#SBATCH --account=nbleier_owned1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-gpu=4
+#SBATCH --mem=48G
+#SBATCH --time=00:40:00
+# Control probe: realized distribution under the OLD 256-grid cfg0-calib table.
+# Runs WITHOUT --sc_halve because the fixed kernels (correctly) refuse
+# stoc_len>128 under halve — halve only changes SC noise, not the
+# threshold classification, so realized level fractions remain valid.
+set -uo pipefail
+REPO=/gpfs/accounts/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_diffusion
+S=/scratch/nbleier_owned_root/nbleier_owned1/zhkangqi
+CKPT=$S/pretrained_models/DiT-XL-2-256x256.pt
+OLD_CALIB=$S/scmp_diffusion_fid_mp_cfg15/calib_global_perrow_flop_halve/calib_fix_avg48.json
+WORK=$S/scmp_diffusion_fid_mp_globalpr_flop_halve128_cfg15/_dist_probe
+mkdir -p "$WORK"
+source /home/zhkangqi/miniconda3/etc/profile.d/conda.sh; conda activate qdit
+export SC_OWEN_MODE=bitrev PYTHONUNBUFFERED=1 OMP_NUM_THREADS=2; cd "$REPO"
+exec > >(tee "$WORK/probe_old.log") 2>&1
+
+echo "===== probe old(halve-off) levels=256,192,128,96,64,48,32,16 ====="
+rm -rf "$WORK/old"; mkdir -p "$WORK/old"
+python -u scripts/quant_sc_main.py \
+    --wbits 8 --abits 8 --w_sym --a_sym \
+    --timewise 1 --qklayerwise 1.0 --avlayerwise 1.0 --projlayerwise 1.0 --mlplayerwise 1.0 --inputprojlayerwise 1.0 \
+    --sc_prec 8 --sc_fixed_level_prec --sc_qk_granularity per_row \
+    --adaptive_mp --adaptive_mp_table "$OLD_CALIB" --mp_levels "256,192,128,96,64,48,32,16" \
+    --image-size 256 --num-sampling-steps 10 --cfg-scale 1.5 \
+    --seed 0 --results-dir "$WORK/old" --ckpt "$CKPT"
+find "$WORK/old" -name 'debug_mp_distribution.csv' -exec cp {} "$WORK/dist_old.csv" \;
+
+python - << 'EOF'
+import csv, collections
+W = "/scratch/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_diffusion_fid_mp_globalpr_flop_halve128_cfg15/_dist_probe"
+per_op = collections.defaultdict(collections.Counter); tot = collections.Counter()
+for row in csv.DictReader(open(f"{W}/dist_old.csv")):
+    op = row["operator"]
+    for k, v in row.items():
+        if k.startswith("sl_") and k.endswith("_count") and v:
+            per_op[op][int(k.split("_")[1])] += int(v); tot[op] += int(v)
+print("===== REALIZED (old table, runtime cfg1.5, halve-off) =====")
+for op in sorted(per_op):
+    c = per_op[op]; n = tot[op]
+    avg = sum(sl * cnt for sl, cnt in c.items()) / max(n, 1)
+    fr = "  ".join(f"{sl}:{100*cnt/n:.1f}%" for sl, cnt in sorted(c.items(), reverse=True))
+    print(f"  {op:12s} avg={avg:7.1f}  {fr}")
+EOF
+echo "DONE $(date)"

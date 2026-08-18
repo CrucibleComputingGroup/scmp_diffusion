@@ -1,0 +1,43 @@
+#!/bin/bash
+#SBATCH --job-name=kband_eq
+#SBATCH --partition=gpu-rtx6000
+#SBATCH --account=nbleier_owned1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-gpu=4
+#SBATCH --mem-per-gpu=32G
+#SBATCH --time=00:30:00
+#SBATCH --output=/gpfs/accounts/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_diffusion/slurm/kband_eq_%j.out
+#
+# K-band correctness gate. Two things must hold or the whole allocation story
+# is void:
+#   1. With every band's ladder equal to the parent ladder, banded dispatch
+#      reproduces the per-row parent (fp32 summation order only).
+#   2. A non-uniform ladder actually changes the result -- otherwise the
+#      dispatch is a no-op dressed as a refinement.
+set -uo pipefail
+# Slurm stages the script into /var/spool, so $0 is not the repo copy.
+# Override to verify a worktree / clone; the default is the main checkout.
+REPO="${KBAND_REPO:-/gpfs/accounts/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_diffusion}"
+cd "$REPO" || exit 1
+source /home/zhkangqi/miniconda3/etc/profile.d/conda.sh; conda activate qdit
+
+echo "=== node $(hostname) ==="
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+
+# scmp_kernels is an EDITABLE install, so it does not follow $REPO and cannot be
+# redirected with PYTHONPATH. Print what actually got imported: a gate whose log
+# cannot prove which trees it ran against proves nothing.
+echo "=== trees under test ==="
+python -c "
+import inspect, scmp_kernels.mp.config as c, qdit.sc_integration.sc_kbands as k
+print('  scmp_kernels:', inspect.getfile(c))
+print('  qdit        :', inspect.getfile(k))
+"
+
+echo
+echo "=== k-band unit + equivalence tests ==="
+python -m pytest tests/test_kbands.py -v 2>&1 | tail -40
+
+echo
+echo "=== end-to-end: banded SCMlp vs per-row parent on one block ==="
+python scripts/verify_kband_e2e.py

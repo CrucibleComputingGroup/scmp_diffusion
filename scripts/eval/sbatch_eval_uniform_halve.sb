@@ -1,0 +1,43 @@
+#!/bin/bash
+#SBATCH --job-name=eval_uni
+#SBATCH --partition=gpu-rtx6000
+#SBATCH --account=nbleier_owned1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-gpu=4
+#SBATCH --mem=48G
+#SBATCH --time=00:45:00
+# GPU eval for one uniform (halve) config: KID + FID/IS/sFID/Prec/Recall.
+# Same methodology as sbatch_eval_mp_flop_halve.sb, repointed to the uniform dir.
+# Usage: sbatch sbatch_eval_uniform_halve.sb <AVG>
+set -uo pipefail
+AVG="${1:?usage: sbatch sbatch_eval_uniform_halve.sb <AVG>}"
+REPO=/gpfs/accounts/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_diffusion
+PREV=/gpfs/accounts/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_diffusion_prev
+PACKER=$PREV/imagenet256_ref/parallel_npz.py
+REF=$PREV/imagenet256_ref/VIRTUAL_imagenet256_labeled.npz
+BASE=/scratch/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_diffusion_fid_uniform_halveON_cfg15/uniform${AVG}
+AD=$BASE/samples
+WORK=$BASE/_eval; mkdir -p "$WORK"
+OUT=$WORK/eval_uniform${AVG}.txt
+source /home/zhkangqi/miniconda3/etc/profile.d/conda.sh
+exec > >(tee "$OUT") 2>&1
+echo "############ UNIFORM(halve) EVAL uniform${AVG} (GPU)  $(date) ############"
+
+IDX=$WORK/idx.txt; NPZ=$WORK/uniform${AVG}.npz
+(cd "$AD" && ls [0-9][0-9][0-9][0-9][0-9][0-9].png | awk '($1+0)<2000' | sort) > "$IDX"
+SEL=$WORK/sel; rm -rf "$SEL"; mkdir -p "$SEL"
+while read -r f; do [[ -n "$f" ]] && ln -sf "$AD/$f" "$SEL/$f"; done < "$IDX"
+echo "=== matched idx 0-1999: $(wc -l < "$IDX") ==="
+
+conda activate qdit
+python -u "$PACKER" "$SEL" "$NPZ"
+conda deactivate
+
+conda activate tfeval
+export TF_CPP_MIN_LOG_LEVEL=2 EVALUATOR=$PREV/Q-DiT/models/evaluations/evaluator.py
+echo ""; echo "===== [1] KID vs ref (idx 0-1999) ====="
+bash "$REPO/scripts/eval/kid_openai.sh" "$WORK/kid_uniform${AVG}.txt" "$NPZ"
+echo ""; echo "===== [2] FID / IS / sFID / Precision / Recall vs ref ====="
+python -u "$EVALUATOR" "$REF" "$NPZ" 2>&1 | grep -E "^(Inception Score|FID|sFID|Precision|Recall):" | sed "s/^/[uniform${AVG}] /"
+conda deactivate
+echo ""; echo "############ DONE uniform${AVG}  $(date) ############"
